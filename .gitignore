@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# MotionBuilder / Autodesk
+*.bak
+*.bck
+*.fbm/
+*.fbx.bak
+*.fbx.import
+*.fbx.export
+*.log
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# Local secrets / configs
+*.local
+.env
+.env.*
