@@ -78,12 +78,20 @@ whichever fits your workflow.
 
 ### Option A: Menu auto-install (recommended)
 
-1. Copy (or symlink) `Retargeter/install_menu.py` into MotionBuilder's
-   startup folder, typically:
+For most users the simplest path is the **repo-wide aggregate
+installer** at the project root - it registers every shipped tool
+(Retargeter, TPoseAligner, ...) at once. See
+[`../README.md`](../README.md) "Quick install".
+
+If you only want to install Retargeter on its own (e.g. you do not
+have the rest of the repo), drop **this package's** `install_menu.py`
+into MotionBuilder's startup folder instead:
+
+1. Copy (or symlink) `Retargeter/install_menu.py` into:
    - Windows: `Documents\MB\<version>\config\Scripts\Startup\`
 2. Restart MotionBuilder. A top-level **"Tools"** menu appears (shared
-   with sibling tools such as TPoseAligner) and a **"Retargeter"**
-   submenu is added under it.
+   with any sibling tools that follow the same convention) and a
+   **"Retargeter"** submenu is added under it.
 3. Click **Tools -> Retargeter -> Open Retargeter Panel...** to launch.
 
 `install_menu.py` self-locates the package via `__file__`, so it works
