@@ -57,7 +57,34 @@ from typing import Callable
 
 _PARENT_MENU_NAME = "Tools"
 _REQUIRED_PACKAGES = ("Retargeter", "TPoseAligner")
-_INSTALLED = False
+
+# Persistent install state.
+#
+# A plain module-level ``_INSTALLED`` flag is reset to ``False`` every time
+# this file is re-parsed - and the most common deployment is to call it via
+# ``exec(open(r"...\\install_menus.py").read())`` from MotionBuilder's Python
+# editor, which DOES re-parse the file on every run. The flag therefore has
+# to live somewhere the second exec can still see, so we stash a tiny state
+# object on the ``sys`` module (which survives anything short of restarting
+# MoBu). The same object also holds dispatcher closures so MoBu's menu event
+# manager keeps a live reference after this module's globals are dropped.
+_PERSIST_ATTR = "_mobu_install_menus_state"
+
+
+class _InstallState:
+    __slots__ = ("installed", "dispatchers")
+
+    def __init__(self) -> None:
+        self.installed: bool = False
+        self.dispatchers: list = []
+
+
+def _persistent_state() -> _InstallState:
+    state = getattr(sys, _PERSIST_ATTR, None)
+    if not isinstance(state, _InstallState):
+        state = _InstallState()
+        setattr(sys, _PERSIST_ATTR, state)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -260,12 +287,6 @@ _TOOLS: tuple[ToolMenu, ...] = (
 # Menu wiring
 # ---------------------------------------------------------------------------
 
-# OnMenuActivate handlers are added to MotionBuilder's event manager via
-# ``Add()``. Some MoBu builds keep only weak references to handlers, so we
-# stash the dispatcher closures here to make sure they survive GC.
-_dispatchers: list[MenuCallback] = []
-
-
 def _ensure_parent_menu(manager) -> None:
     """Create the shared "Tools" menu if it does not exist yet."""
     if manager.GetMenu(_PARENT_MENU_NAME) is None:
@@ -298,10 +319,27 @@ def _make_dispatcher(label_to_callback: dict[str, MenuCallback]) -> MenuCallback
 
 
 def _register_tool(manager, tool: ToolMenu) -> None:
-    """Add one :class:`ToolMenu` under the shared parent and wire callbacks."""
+    """Add one :class:`ToolMenu` under the shared parent and wire callbacks.
+
+    Idempotent at the submenu level: if a submenu with the same path already
+    exists we assume a previous install populated it, and skip item insertion
+    entirely so re-running this file does not stack duplicate rows like
+    "Open Retargeter Panel..., Open Retargeter Panel...".
+
+    Note on call ordering: ``FBMenuManager.GetMenu("Tools/Retargeter")`` only
+    starts returning a non-None ``FBGenericMenu`` once at least one item has
+    been inserted into that path. So the lookup must happen AFTER the item
+    insertion loop, not right after ``InsertLast(parent, submenu_name)``.
+    """
     submenu_path = f"{_PARENT_MENU_NAME}/{tool.submenu_name}"
-    if manager.GetMenu(submenu_path) is None:
-        manager.InsertLast(_PARENT_MENU_NAME, tool.submenu_name)
+
+    if manager.GetMenu(submenu_path) is not None:
+        _logger.debug(
+            "submenu %r already exists; skipping item insertion.", submenu_path
+        )
+        return
+
+    manager.InsertLast(_PARENT_MENU_NAME, tool.submenu_name)
 
     label_to_callback: dict[str, MenuCallback] = {}
     for item in tool.items:
@@ -316,7 +354,9 @@ def _register_tool(manager, tool: ToolMenu) -> None:
 
     if label_to_callback:
         dispatcher = _make_dispatcher(label_to_callback)
-        _dispatchers.append(dispatcher)  # keep alive across GC
+        # Stash on the persistent state so MoBu's event manager keeps a live
+        # reference even after this module's globals are GC'd by a reload.
+        _persistent_state().dispatchers.append(dispatcher)
         submenu.OnMenuActivate.Add(dispatcher)
 
     _logger.info(
@@ -329,13 +369,15 @@ def _register_tool(manager, tool: ToolMenu) -> None:
 def install_all_menus() -> bool:
     """Register every tool's submenu under the shared Tools menu.
 
-    Idempotent: subsequent calls in the same MoBu session are no-ops.
+    Idempotent across MoBu sessions AND across reloads of this file: the
+    "already installed" flag lives on ``sys`` (see :func:`_persistent_state`),
+    so a second ``exec(open(...).read())`` is a no-op instead of doubling the
+    menu items.
     """
-    global _INSTALLED
-
     _setup_logging()
+    state = _persistent_state()
 
-    if _INSTALLED:
+    if state.installed:
         _logger.debug("install_all_menus: already installed; skipping.")
         return True
 
@@ -354,7 +396,7 @@ def install_all_menus() -> bool:
         for tool in _TOOLS:
             _register_tool(manager, tool)
 
-        _INSTALLED = True
+        state.installed = True
         _logger.info(
             "%r menu installed (%s).",
             _PARENT_MENU_NAME,

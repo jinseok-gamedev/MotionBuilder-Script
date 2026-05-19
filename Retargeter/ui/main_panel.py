@@ -19,7 +19,7 @@ callback and the logger sink so it can stream feedback into the UI.
 from __future__ import annotations
 
 import os
-from typing import List, Optional
+from typing import List
 
 from ._qt import QtCore, QtWidgets  # type: ignore
 
@@ -587,49 +587,56 @@ class RetargeterPanel(QtWidgets.QWidget):
 
 
 # ----------------------------------------------------------------------------
-# Singleton-style show helper
+# Single-instance show helper
 # ----------------------------------------------------------------------------
 
-_panel_singleton: Optional[RetargeterPanel] = None
+
+def _close_existing_instances() -> None:
+    """Close any prior copy of this panel still alive in the Qt app.
+
+    A module-level singleton variable is NOT reliable here: the menu callback
+    in ``install_menus.py`` purges the whole ``Retargeter`` package out of
+    ``sys.modules`` before re-importing, which throws away any cached
+    reference. The QWidget itself, however, is owned by Qt and survives the
+    Python reload, so we find it by enumerating top-level widgets and
+    matching on ``objectName``.
+    """
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        try:
+            if widget.objectName() != WINDOW_OBJECT_NAME:
+                continue
+        except RuntimeError:
+            # Underlying C++ object already deleted - safe to ignore.
+            continue
+        try:
+            widget.close()
+            widget.deleteLater()
+        except Exception:
+            pass
 
 
 def show_panel() -> RetargeterPanel:
-    """Create the panel (or raise the existing one) and return it.
+    """Create the panel and return it, enforcing a single live instance.
 
     Importing this module triggers the Qt binding (PySide6 in MoBu 2025+,
-    PySide2 in older versions) which is only valid inside MotionBuilder. The
-    function is also reusable: subsequent calls re-show the same panel so
-    the user can keep their file list across invocations during a session.
+    PySide2 in older versions) which is only valid inside MotionBuilder. If
+    the panel is already open from a previous click, that instance is
+    closed first so the user always sees exactly one panel.
     """
-    global _panel_singleton
-
     app = QtWidgets.QApplication.instance()
     if app is None:
         app = QtWidgets.QApplication([])  # MoBu provides one, but guard anyway.
 
-    # Always rebuild: re-executing retargeter.py reloads the modules so the
-    # cached singleton would otherwise be an instance of a stale class.
-    if _panel_singleton is not None and _is_widget_alive(_panel_singleton):
-        try:
-            _panel_singleton.close()
-            _panel_singleton.deleteLater()
-        except Exception:
-            pass
-        _panel_singleton = None
+    _close_existing_instances()
 
     parent = find_motionbuilder_main_window()
-    _panel_singleton = RetargeterPanel(parent=parent)
+    panel = RetargeterPanel(parent=parent)
     if parent is not None:
-        _panel_singleton.setWindowFlags(QtCore.Qt.Tool)
-    _panel_singleton.show()
-    _panel_singleton.raise_()
-    _panel_singleton.activateWindow()
-    return _panel_singleton
-
-
-def _is_widget_alive(widget) -> bool:
-    try:
-        widget.objectName()
-        return True
-    except RuntimeError:
-        return False
+        panel.setWindowFlags(QtCore.Qt.Tool)
+    panel.show()
+    panel.raise_()
+    panel.activateWindow()
+    return panel

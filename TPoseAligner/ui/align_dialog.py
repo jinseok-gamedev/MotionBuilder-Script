@@ -49,7 +49,7 @@ from ..core.validation import (
 )
 
 
-_dialog_instance: Optional["AlignDialog"] = None
+ALIGN_DIALOG_OBJECT_NAME = "TPoseAlignerAlignDialog"
 
 
 def _scene_characters() -> List:
@@ -76,6 +76,7 @@ class AlignDialog(QtWidgets.QDialog):
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
+        self.setObjectName(ALIGN_DIALOG_OBJECT_NAME)
         self.setWindowTitle("TPoseAligner - Pair Align")
         self.resize(720, 640)
         self.setSizeGripEnabled(True)
@@ -503,24 +504,43 @@ class AlignDialog(QtWidgets.QDialog):
         self.status.setText(text)
 
 
-def show_align_dialog():
-    """Singleton-style entry point for the menu / Python editor."""
-    global _dialog_instance
-    parent = None
-    try:
-        from pyfbsdk import FBSystem  # type: ignore  # noqa: F401
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        parent = app.activeWindow()
-    except Exception:
-        pass
+def _close_existing_align_dialogs() -> None:
+    """Close any prior copy of this dialog still alive in the Qt app.
 
-    if _dialog_instance is None or not _dialog_instance.isVisible():
-        _dialog_instance = AlignDialog(parent)
-    _dialog_instance.refresh_characters()
-    _dialog_instance.show()
-    _dialog_instance.raise_()
-    _dialog_instance.activateWindow()
-    return _dialog_instance
+    The menu callback in ``install_menus.py`` purges the whole
+    ``TPoseAligner`` package out of ``sys.modules`` before re-importing, so a
+    module-level singleton reference is unreliable. The QWidget itself is
+    owned by Qt and survives reloads, so we find it via ``objectName``.
+    """
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        try:
+            if widget.objectName() != ALIGN_DIALOG_OBJECT_NAME:
+                continue
+        except RuntimeError:
+            continue
+        try:
+            widget.close()
+            widget.deleteLater()
+        except Exception:
+            pass
+
+
+def show_align_dialog():
+    """Single-instance entry point for the menu / Python editor."""
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    _close_existing_align_dialogs()
+
+    parent = app.activeWindow()
+    dialog = AlignDialog(parent)
+    dialog.refresh_characters()
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
+    return dialog
 
 
 if __name__ == "__main__":

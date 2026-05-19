@@ -20,12 +20,13 @@ from ..batch.batch_retarget import (
 from ..core.tpose_align import AlignOptions
 
 
-_dialog_instance: Optional["BatchDialog"] = None
+BATCH_DIALOG_OBJECT_NAME = "TPoseAlignerBatchDialog"
 
 
 class BatchDialog(QtWidgets.QDialog):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
+        self.setObjectName(BATCH_DIALOG_OBJECT_NAME)
         self.setWindowTitle("TPoseAligner - Batch Retarget")
         self.resize(720, 540)
         self.setSizeGripEnabled(True)
@@ -209,22 +210,41 @@ class BatchDialog(QtWidgets.QDialog):
             self.results_table.setItem(row, 4, cell(short_err))
 
 
-def show_batch_dialog():
-    global _dialog_instance
-    parent = None
-    try:
-        from pyfbsdk import FBSystem  # type: ignore  # noqa: F401
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        parent = app.activeWindow()
-    except Exception:
-        pass
+def _close_existing_batch_dialogs() -> None:
+    """Close any prior copy of this dialog still alive in the Qt app.
 
-    if _dialog_instance is None or not _dialog_instance.isVisible():
-        _dialog_instance = BatchDialog(parent)
-    _dialog_instance.show()
-    _dialog_instance.raise_()
-    _dialog_instance.activateWindow()
-    return _dialog_instance
+    See ``align_dialog._close_existing_align_dialogs`` for the rationale -
+    module reloads invalidate Python-side singleton refs, but Qt still owns
+    the live widget.
+    """
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        try:
+            if widget.objectName() != BATCH_DIALOG_OBJECT_NAME:
+                continue
+        except RuntimeError:
+            continue
+        try:
+            widget.close()
+            widget.deleteLater()
+        except Exception:
+            pass
+
+
+def show_batch_dialog():
+    """Single-instance entry point for the menu / Python editor."""
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    _close_existing_batch_dialogs()
+
+    parent = app.activeWindow()
+    dialog = BatchDialog(parent)
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
+    return dialog
 
 
 if __name__ == "__main__":
