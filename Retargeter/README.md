@@ -21,7 +21,6 @@ ready for the destination DCC.
 ```
 Retargeter/
   retargeter.py               # entry point you exec from the Python Editor
-  install_menu.py             # registers a "Retargeter" menu in MotionBuilder
   Retargeter_Start.py         # one-shot launcher (forwards to retargeter.py)
   __init__.py
   core/
@@ -78,26 +77,14 @@ whichever fits your workflow.
 
 ### Option A: Menu auto-install (recommended)
 
-For most users the simplest path is the **repo-wide aggregate
-installer** at the project root - it registers every shipped tool
-(Retargeter, TPoseAligner, ...) at once. See
-[`../README.md`](../README.md) "Quick install".
+Use the repo-wide aggregate installer at the project root - it
+registers every shipped tool (Retargeter, TPoseAligner, ...) under a
+single shared **Tools** menu in MotionBuilder. See the root
+[`../README.md`](../README.md) "Quick install" section for the
+PowerShell symlink one-liner.
 
-If you only want to install Retargeter on its own (e.g. you do not
-have the rest of the repo), drop **this package's** `install_menu.py`
-into MotionBuilder's startup folder instead:
-
-1. Copy (or symlink) `Retargeter/install_menu.py` into:
-   - Windows: `Documents\MB\<version>\config\Scripts\Startup\`
-2. Restart MotionBuilder. A top-level **"Tools"** menu appears (shared
-   with any sibling tools that follow the same convention) and a
-   **"Retargeter"** submenu is added under it.
-3. Click **Tools -> Retargeter -> Open Retargeter Panel...** to launch.
-
-`install_menu.py` self-locates the package via `__file__`, so it works
-regardless of where you cloned the repo on disk. The "Tools" parent
-menu is created only if it does not already exist, so installing
-multiple tools does not produce duplicate menus.
+After install, launch via **Tools -> Retargeter -> Open Retargeter
+Panel...**.
 
 ### Option B: One-shot launcher (good for development)
 

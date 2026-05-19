@@ -66,12 +66,26 @@ location instead - the script's path-resolution fallback locates the
 repo via common project folders (`Desktop\MotionBuilder-Script`,
 `Documents\MotionBuilder-Script`).
 
-## Manual install (one tool at a time)
+## Manual install from the Python Editor
 
-If you only want one of the tools, use that package's own
-`install_menu.py` - see the per-tool README for details. Each tool's
-installer is fully independent and can be triggered from the Python
-Editor without `install_menus.py`.
+If you cannot copy files into the Startup folder (e.g. locked-down
+production setup), call the installer directly from MotionBuilder's
+Python Editor on every launch:
+
+```python
+import sys
+sys.path.insert(0, r"C:\path\to\MotionBuilder-Script")
+import install_menus  # auto-registers menus on import
+```
+
+Or, if you want explicit control over when the menu appears:
+
+```python
+import os
+os.environ["MOBU_TOOLS_AUTO_INSTALL"] = "0"  # disable on-import auto-run
+import install_menus
+install_menus.install_all_menus()
+```
 
 ## Usage
 
