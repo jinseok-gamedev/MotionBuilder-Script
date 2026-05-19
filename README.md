@@ -30,9 +30,9 @@ startup folder so every tool's menu installs automatically on launch:
 - Windows: `Documents\MB\<version>\config\Scripts\Startup\`
 
 The aggregate installer self-locates the repo via `__file__`, falls back
-to scanning `sys.path` and conventional project paths, and runs each
-tool's `install_menu.install_menu()` independently. A failure in one
-tool never blocks the others.
+to scanning `sys.path` and conventional project paths, and registers each
+tool's submenu independently. A failure in one tool's submenu never
+blocks the others.
 
 After restart, MotionBuilder's menubar gets a single **Tools** menu:
 
@@ -86,6 +86,42 @@ os.environ["MOBU_TOOLS_AUTO_INSTALL"] = "0"  # disable on-import auto-run
 import install_menus
 install_menus.install_all_menus()
 ```
+
+## Environment variables
+
+Both variables are optional and read by `install_menus.py`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MOBU_TOOLS_AUTO_INSTALL` | `1` | Set to `0` to skip the on-import auto-run, so a caller can invoke `install_menus.install_all_menus()` at a controlled point (e.g. from a custom startup script). |
+| `MOBU_TOOLS_LOG_LEVEL` | `INFO` | Python `logging` level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. `DEBUG` adds idempotent-skip messages and is useful when diagnosing why a menu did not appear. |
+
+Set them in MotionBuilder's launch environment, in your shell before
+launching `motionbuilder.exe`, or programmatically before importing the
+installer:
+
+```python
+import os
+os.environ["MOBU_TOOLS_LOG_LEVEL"] = "DEBUG"
+import install_menus
+```
+
+## Adding a new tool
+
+Each tool is a Python package at the repo root with its own
+`__init__.py`, plus an entry in `install_menus.py`'s `_TOOLS` registry.
+To add a tool:
+
+1. Drop the package folder next to `Retargeter/` and `TPoseAligner/`
+   (and update `_REQUIRED_PACKAGES` in `install_menus.py` if the path
+   resolver should consider it mandatory).
+2. In `install_menus.py`, add menu callback function(s) that take
+   `(control, event)`, do their work, and log via `_logger`.
+3. Append a `ToolMenu(submenu_name=..., items=(MenuItem(...), ...))`
+   entry to `_TOOLS`. Empty-label items become separators.
+
+The next MotionBuilder launch picks the new submenu up automatically -
+no other code changes are required.
 
 ## Usage
 

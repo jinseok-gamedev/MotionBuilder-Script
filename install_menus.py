@@ -31,26 +31,87 @@ that package's cached modules first, so edits made in Cursor are picked
 up on the next click without restarting MotionBuilder. Each click only
 reloads the package owning the clicked submenu, never its siblings.
 
-Set ``MOBU_TOOLS_AUTO_INSTALL=0`` to skip the on-import auto-run when
-calling :func:`install_all_menus` from your own startup script.
+Adding a new tool requires only:
+
+1. Defining its callback function(s) in this module.
+2. Appending a :class:`ToolMenu` entry to :data:`_TOOLS`.
+
+Environment variables:
+
+* ``MOBU_TOOLS_AUTO_INSTALL=0`` skips the on-import auto-run, so callers
+  can invoke :func:`install_all_menus` at a controlled point.
+* ``MOBU_TOOLS_LOG_LEVEL`` (default ``INFO``) controls logging
+  verbosity. Accepts any standard ``logging`` level name: ``DEBUG``,
+  ``INFO``, ``WARNING``, ``ERROR``, ``CRITICAL``.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
-import traceback
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 _PARENT_MENU_NAME = "Tools"
-_RETARGETER_SUBMENU = "Retargeter"
-_TPOSE_SUBMENU = "TPose Align"
-_RETARGETER_PATH = f"{_PARENT_MENU_NAME}/{_RETARGETER_SUBMENU}"
-_TPOSE_PATH = f"{_PARENT_MENU_NAME}/{_TPOSE_SUBMENU}"
-
 _REQUIRED_PACKAGES = ("Retargeter", "TPoseAligner")
 _INSTALLED = False
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger("install_menus")
+
+
+def _setup_logging() -> None:
+    """Configure the ``install_menus`` logger from ``MOBU_TOOLS_LOG_LEVEL``.
+
+    Idempotent: handlers are only attached the first time. ``propagate``
+    is disabled so we do not double-print through MotionBuilder's root
+    logger when the host configures one of its own.
+    """
+    level_name = os.environ.get("MOBU_TOOLS_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    _logger.setLevel(level)
+    if not _logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("[install_menus] %(levelname)s: %(message)s")
+        )
+        _logger.addHandler(handler)
+        _logger.propagate = False
+
+
+# ---------------------------------------------------------------------------
+# Declarative menu schema
+# ---------------------------------------------------------------------------
+
+# MotionBuilder OnMenuActivate handlers receive (control, event).
+MenuCallback = Callable[[object, object], None]
+
+
+@dataclass(frozen=True)
+class MenuItem:
+    """One row inside a tool's submenu. ``label=""`` becomes a separator."""
+
+    label: str
+    callback: MenuCallback | None = None
+
+    @property
+    def is_separator(self) -> bool:
+        return not self.label
+
+
+@dataclass(frozen=True)
+class ToolMenu:
+    """A submenu registered under the shared "Tools" parent menu."""
+
+    submenu_name: str
+    items: tuple[MenuItem, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +127,8 @@ def _looks_like_repo(path: str) -> bool:
 def _ensure_repo_on_path() -> str:
     """Locate the repo root and add it to ``sys.path``.
 
-    Returns the resolved path for logging. Raises if it cannot be found.
+    Returns the resolved path. Raises :class:`RuntimeError` if it cannot
+    be found.
     """
     candidates: list[str] = []
 
@@ -120,17 +182,7 @@ def _open_retargeter_panel(control, event) -> None:
         from Retargeter import show_panel
         show_panel()
     except Exception:
-        traceback.print_exc()
-
-
-def _on_retargeter_menu(control, event) -> None:
-    label = ""
-    try:
-        label = event.Name
-    except Exception:
-        pass
-    if "Open" in label or "Panel" in label:
-        _open_retargeter_panel(control, event)
+        _logger.exception("open Retargeter panel failed")
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +196,7 @@ def _open_tpose_align_dialog(control, event) -> None:
         from TPoseAligner.ui import show_align_dialog
         show_align_dialog()
     except Exception:
-        traceback.print_exc()
+        _logger.exception("open TPose Pair Align dialog failed")
 
 
 def _open_tpose_batch_dialog(control, event) -> None:
@@ -154,7 +206,7 @@ def _open_tpose_batch_dialog(control, event) -> None:
         from TPoseAligner.ui import show_batch_dialog
         show_batch_dialog()
     except Exception:
-        traceback.print_exc()
+        _logger.exception("open TPose Batch dialog failed")
 
 
 def _reset_tpose_offsets(control, event) -> None:
@@ -178,26 +230,41 @@ def _reset_tpose_offsets(control, event) -> None:
             "OK",
         )
     except Exception:
-        traceback.print_exc()
+        _logger.exception("reset TPose offsets failed")
 
 
-def _on_tpose_menu(control, event) -> None:
-    label = ""
-    try:
-        label = event.Name
-    except Exception:
-        pass
-    if "Pair" in label:
-        _open_tpose_align_dialog(control, event)
-    elif "Batch" in label:
-        _open_tpose_batch_dialog(control, event)
-    elif "Reset" in label:
-        _reset_tpose_offsets(control, event)
+# ---------------------------------------------------------------------------
+# Tool registry - add new tools by appending an entry here
+# ---------------------------------------------------------------------------
+
+_TOOLS: tuple[ToolMenu, ...] = (
+    ToolMenu(
+        submenu_name="Retargeter",
+        items=(
+            MenuItem("Open Retargeter Panel...", _open_retargeter_panel),
+        ),
+    ),
+    ToolMenu(
+        submenu_name="TPose Align",
+        items=(
+            MenuItem("T-Pose Pair Align...", _open_tpose_align_dialog),
+            MenuItem("Batch Retarget...", _open_tpose_batch_dialog),
+            MenuItem(""),
+            MenuItem("Reset Offsets on Current Character", _reset_tpose_offsets),
+        ),
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
 # Menu wiring
 # ---------------------------------------------------------------------------
+
+# OnMenuActivate handlers are added to MotionBuilder's event manager via
+# ``Add()``. Some MoBu builds keep only weak references to handlers, so we
+# stash the dispatcher closures here to make sure they survive GC.
+_dispatchers: list[MenuCallback] = []
+
 
 def _ensure_parent_menu(manager) -> None:
     """Create the shared "Tools" menu if it does not exist yet."""
@@ -205,55 +272,97 @@ def _ensure_parent_menu(manager) -> None:
         manager.InsertBefore(None, "Help", _PARENT_MENU_NAME)
 
 
+def _make_dispatcher(label_to_callback: dict[str, MenuCallback]) -> MenuCallback:
+    """Build an OnMenuActivate handler that dispatches by clicked label.
+
+    Falls back to substring matching if MotionBuilder ever decorates the
+    label (e.g. with accelerator key prefixes) before passing it back.
+    """
+
+    def _dispatch(control, event):
+        clicked = ""
+        try:
+            clicked = event.Name
+        except Exception:
+            return
+        cb = label_to_callback.get(clicked)
+        if cb is None:
+            for label, candidate in label_to_callback.items():
+                if label and (label in clicked or clicked in label):
+                    cb = candidate
+                    break
+        if cb is not None:
+            cb(control, event)
+
+    return _dispatch
+
+
+def _register_tool(manager, tool: ToolMenu) -> None:
+    """Add one :class:`ToolMenu` under the shared parent and wire callbacks."""
+    submenu_path = f"{_PARENT_MENU_NAME}/{tool.submenu_name}"
+    if manager.GetMenu(submenu_path) is None:
+        manager.InsertLast(_PARENT_MENU_NAME, tool.submenu_name)
+
+    label_to_callback: dict[str, MenuCallback] = {}
+    for item in tool.items:
+        manager.InsertLast(submenu_path, item.label)
+        if not item.is_separator and item.callback is not None:
+            label_to_callback[item.label] = item.callback
+
+    submenu = manager.GetMenu(submenu_path)
+    if submenu is None:
+        _logger.error("failed to retrieve submenu %r", submenu_path)
+        return
+
+    if label_to_callback:
+        dispatcher = _make_dispatcher(label_to_callback)
+        _dispatchers.append(dispatcher)  # keep alive across GC
+        submenu.OnMenuActivate.Add(dispatcher)
+
+    _logger.info(
+        "registered submenu %r (%d active item(s))",
+        submenu_path,
+        len(label_to_callback),
+    )
+
+
 def install_all_menus() -> bool:
-    """Register every shipped tool's submenu under the shared Tools menu.
+    """Register every tool's submenu under the shared Tools menu.
 
     Idempotent: subsequent calls in the same MoBu session are no-ops.
     """
     global _INSTALLED
+
+    _setup_logging()
+
     if _INSTALLED:
+        _logger.debug("install_all_menus: already installed; skipping.")
         return True
 
     repo = _ensure_repo_on_path()
-    print(f"install_menus: project root = {repo}")
+    _logger.info("project root = %s", repo)
 
     try:
         from pyfbsdk import FBMenuManager  # type: ignore
     except ImportError:
-        print("install_menus: pyfbsdk not available, skipping.")
+        _logger.warning("pyfbsdk not available; skipping menu install.")
         return False
 
     try:
         manager = FBMenuManager()
         _ensure_parent_menu(manager)
-
-        # Retargeter submenu
-        if manager.GetMenu(_RETARGETER_PATH) is None:
-            manager.InsertLast(_PARENT_MENU_NAME, _RETARGETER_SUBMENU)
-        manager.InsertLast(_RETARGETER_PATH, "Open Retargeter Panel...")
-        retargeter_menu = manager.GetMenu(_RETARGETER_PATH)
-        if retargeter_menu is not None:
-            retargeter_menu.OnMenuActivate.Add(_on_retargeter_menu)
-
-        # TPoseAligner submenu
-        if manager.GetMenu(_TPOSE_PATH) is None:
-            manager.InsertLast(_PARENT_MENU_NAME, _TPOSE_SUBMENU)
-        manager.InsertLast(_TPOSE_PATH, "T-Pose Pair Align...")
-        manager.InsertLast(_TPOSE_PATH, "Batch Retarget...")
-        manager.InsertLast(_TPOSE_PATH, "")
-        manager.InsertLast(_TPOSE_PATH, "Reset Offsets on Current Character")
-        tpose_menu = manager.GetMenu(_TPOSE_PATH)
-        if tpose_menu is not None:
-            tpose_menu.OnMenuActivate.Add(_on_tpose_menu)
+        for tool in _TOOLS:
+            _register_tool(manager, tool)
 
         _INSTALLED = True
-        print(
-            f"install_menus: '{_PARENT_MENU_NAME}' menu installed "
-            f"({_RETARGETER_SUBMENU}, {_TPOSE_SUBMENU})."
+        _logger.info(
+            "%r menu installed (%s).",
+            _PARENT_MENU_NAME,
+            ", ".join(t.submenu_name for t in _TOOLS),
         )
         return True
     except Exception:
-        traceback.print_exc()
+        _logger.exception("install_all_menus failed")
         return False
 
 
