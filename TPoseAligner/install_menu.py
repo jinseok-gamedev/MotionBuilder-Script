@@ -2,12 +2,17 @@
 
 Drop this file in your MotionBuilder ``config/Scripts/Startup`` folder
 (typically ``Documents\\MB\\<version>\\config\\Scripts\\Startup``) - it runs
-automatically on startup and adds a top-level menu with the dialogs.
+automatically on startup and adds a "TPose Align" submenu under a shared
+top-level "Tools" menu.
 
 You can also call :func:`install_menu` from your own startup script:
 
     from TPoseAligner.install_menu import install_menu
     install_menu()
+
+The "Tools" parent menu is shared with sibling tools (e.g. Retargeter);
+each tool's installer creates the parent menu only if it does not already
+exist, so independent installs do not collide.
 """
 
 from __future__ import annotations
@@ -18,7 +23,9 @@ import traceback
 from pathlib import Path
 
 
-_MENU_NAME = "TPose Align"
+_PARENT_MENU_NAME = "Tools"
+_SUBMENU_NAME = "TPose Align"
+_FULL_MENU_PATH = f"{_PARENT_MENU_NAME}/{_SUBMENU_NAME}"
 _INSTALLED = False
 
 
@@ -83,8 +90,17 @@ def _on_menu_activate(control, event) -> None:
         _reset_offsets(control, event)
 
 
+def _ensure_parent_menu(manager) -> None:
+    """Create the shared "Tools" menu if it does not exist yet.
+
+    Idempotent across multiple tools that share the same parent.
+    """
+    if manager.GetMenu(_PARENT_MENU_NAME) is None:
+        manager.InsertBefore(None, "Help", _PARENT_MENU_NAME)
+
+
 def install_menu() -> bool:
-    """Add the menu and wire up callbacks. Idempotent."""
+    """Add the submenu and wire up callbacks. Idempotent."""
     global _INSTALLED
     if _INSTALLED:
         return True
@@ -99,19 +115,23 @@ def install_menu() -> bool:
 
     try:
         manager = FBMenuManager()
-        manager.InsertBefore(None, "Help", _MENU_NAME)
-        manager.InsertLast(_MENU_NAME, "T-Pose Pair Align...")
-        manager.InsertLast(_MENU_NAME, "Batch Retarget...")
-        manager.InsertLast(_MENU_NAME, "")
-        manager.InsertLast(_MENU_NAME, "Reset Offsets on Current Character")
+        _ensure_parent_menu(manager)
 
-        menu = manager.GetMenu(_MENU_NAME)
-        if menu is not None:
-            menu.OnMenuActivate.Add(_on_menu_activate)
+        if manager.GetMenu(_FULL_MENU_PATH) is None:
+            manager.InsertLast(_PARENT_MENU_NAME, _SUBMENU_NAME)
+
+        manager.InsertLast(_FULL_MENU_PATH, "T-Pose Pair Align...")
+        manager.InsertLast(_FULL_MENU_PATH, "Batch Retarget...")
+        manager.InsertLast(_FULL_MENU_PATH, "")
+        manager.InsertLast(_FULL_MENU_PATH, "Reset Offsets on Current Character")
+
+        submenu = manager.GetMenu(_FULL_MENU_PATH)
+        if submenu is not None:
+            submenu.OnMenuActivate.Add(_on_menu_activate)
             _INSTALLED = True
-            print(f"TPoseAligner: '{_MENU_NAME}' menu installed.")
+            print(f"TPoseAligner: '{_FULL_MENU_PATH}' submenu installed.")
             return True
-        print("TPoseAligner: failed to retrieve newly created menu.")
+        print("TPoseAligner: failed to retrieve newly created submenu.")
         return False
     except Exception:
         traceback.print_exc()
