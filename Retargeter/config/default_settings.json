@@ -1,0 +1,39 @@
+{
+    "plot": {
+        "plot_rate": 30,
+        "plot_translation": true,
+        "use_constant_key_reducer": false,
+        "constant_key_reducer_keep_one": true,
+        "precise_time_discontinuities": true,
+        "rotation_filter": "gimble_killer"
+    },
+    "import_options": {
+        "clean_existing_takes": false
+    },
+    "match_source": {
+        "enabled": true
+    },
+    "root_motion": {
+        "default_mode": "keep"
+    },
+    "export": {
+        "fbx_version": "FBX201800",
+        "ascii": false,
+        "embed_media": false,
+        "save_character": false,
+        "save_control_set": false,
+        "save_character_extension": false,
+        "filename_template": "{take}",
+        "on_conflict": "increment"
+    },
+    "metadata": {
+        "inject": true
+    },
+    "engine_preset": "ue5",
+    "naming": {
+        "take_prefix": "",
+        "take_suffix": ""
+    },
+    "dry_run": false,
+    "write_log_file": true
+}
