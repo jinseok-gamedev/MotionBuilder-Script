@@ -70,9 +70,18 @@ class PlotConfig:
 
 
 def _fb_time_for_rate(rate: int) -> FBTime:
-    """30 fps -> 1 frame at 30 fps, 60 fps -> 1 frame at 60 fps, etc."""
+    """30 fps -> 1 frame at 30 fps, 60 fps -> 1 frame at 60 fps, etc.
+
+    MotionBuilder 2026 tightened the ``FBTime(int, int, int, int, int, int)``
+    constructor: the 6th positional argument is now strictly an ``FBTimeMode``
+    enum, not a frame-rate int, so the old ``FBTime(0, 0, 0, 1, 0, rate)``
+    form raises ``ArgumentError``. Building the period from seconds avoids
+    needing a rate->FBTimeMode lookup table and works on every MoBu version.
+    """
     rate = max(1, int(rate))
-    return FBTime(0, 0, 0, 1, 0, rate)
+    t = FBTime()
+    t.SetSecondDouble(1.0 / float(rate))
+    return t
 
 
 def _rotation_filter_enum(name: str):
