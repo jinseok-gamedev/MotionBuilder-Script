@@ -242,6 +242,18 @@ class RetargeterPanel(QtWidgets.QWidget):
         self.chk_clean_takes.setChecked(bool(import_cfg.get("clean_existing_takes", False)))
         v.addWidget(self.chk_clean_takes)
 
+        self.chk_cleanup_dups = QtWidgets.QCheckBox("Cleanup duplicate bones after merge")
+        self.chk_cleanup_dups.setToolTip(
+            "When FBX hierarchy differs from the source rig, FileMerge appends ' <N>' "
+            "to clashing bone names and the animation lands on those duplicates. "
+            "Enable this to transfer the keys back onto the source character bones "
+            "and delete the leftover duplicates so plot has data to read."
+        )
+        self.chk_cleanup_dups.setChecked(
+            bool(import_cfg.get("cleanup_duplicate_bones", True))
+        )
+        v.addWidget(self.chk_cleanup_dups)
+
         self.cmb_root_motion = QtWidgets.QComboBox()
         self.cmb_root_motion.addItems([MODE_KEEP, MODE_STRIP, MODE_EXTRACT])
         self.cmb_root_motion.setCurrentText(str(rm_cfg.get("default_mode", MODE_KEEP)))
@@ -476,6 +488,7 @@ class RetargeterPanel(QtWidgets.QWidget):
             default_root_motion=self.cmb_root_motion.currentText(),
             match_source=self.chk_match_source.isChecked(),
             clean_existing_takes=self.chk_clean_takes.isChecked(),
+            cleanup_duplicate_bones=self.chk_cleanup_dups.isChecked(),
             inject_metadata=self.chk_inject_metadata.isChecked(),
             dry_run=dry_run,
             engine_preset=self.cmb_engine.currentText(),
@@ -572,10 +585,16 @@ class RetargeterPanel(QtWidgets.QWidget):
         return logger
 
     def _log_line(self, line: str) -> None:
+        # NOTE: Do NOT call ``QApplication.processEvents()`` here. Logger lines
+        # are emitted very frequently (one per pipeline phase, plus dozens per
+        # take during cleanup_duplicate_bones). Draining the Qt queue on every
+        # line lets MotionBuilder run its post-FileMerge scene-evaluation
+        # events re-entrantly inside our Python code path, which crashes MoBu
+        # non-deterministically on heavier rigs (UE Mannequin etc.). Progress
+        # feedback is handled separately in ``_on_progress``.
         self.log_view.appendPlainText(line)
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
-        QtWidgets.QApplication.processEvents()
 
     def _on_progress(self, done: int, total: int, message: str) -> None:
         total = max(1, total)

@@ -36,12 +36,15 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from .fbx_io import (
     ExportConfig,
     ExportMetadata,
+    cleanup_duplicate_bones,
+    delete_duplicate_bone_models,
     export_take_to_fbx,
     import_animation_only,
 )
@@ -104,6 +107,12 @@ class RunConfig:
     match_source: bool = True
     clean_existing_takes: bool = False
     inject_metadata: bool = True
+    # Transfer animation off ``" <N>"`` suffix-renamed duplicate bones back
+    # onto the source character's original bones (and delete the duplicates)
+    # right after each FileMerge. Without this, FBX files whose hierarchy
+    # diverges from the source rig will plot empty even though the merge
+    # appeared to succeed.
+    cleanup_duplicate_bones: bool = True
 
     dry_run: bool = False
     write_log_file: bool = True
@@ -137,6 +146,7 @@ class RunConfig:
             "match_source",
             "clean_existing_takes",
             "inject_metadata",
+            "cleanup_duplicate_bones",
             "dry_run",
             "write_log_file",
             "engine_preset",
@@ -356,6 +366,25 @@ def _run_inner(
         clean_all_takes()
 
     created_takes = _import_phase(config, logger, hooks, report)
+    if not created_takes and config.take_plans and config.out_dir:
+        selected_takes = [tp.take_name for tp in config.take_plans if tp.export]
+        if not selected_takes:
+            logger.warn("No takes selected for export.")
+            return report
+        logger.info(f"Exporting {len(selected_takes)} selected existing take(s).")
+        for tp in config.take_plans:
+            if not tp.export:
+                continue
+            if _find_result(report, tp.take_name) is None:
+                report.results.append(
+                    TakeResult(
+                        take_name=tp.take_name,
+                        source_file=tp.source_file,
+                        status="pending",
+                    )
+                )
+        _export_phase(config, target_char, selected_takes, logger, hooks, report, progress_cb)
+        return report
     if not created_takes:
         logger.warn("No takes were created; nothing to plot.")
         return report
@@ -395,19 +424,29 @@ def _import_phase(
             report.results.append(tr)
             continue
 
-        if not new_takes:
-            logger.warn(f"No takes appeared after merging {fbx_path}.")
-            continue
-
         _log_import_diagnostics(diagnostics, logger)
 
+        if not new_takes:
+            logger.warn(f"No takes appeared after merging {fbx_path}.")
+            if config.cleanup_duplicate_bones:
+                try:
+                    delete_duplicate_bone_models(diagnostics, logger=logger)
+                except Exception as exc:
+                    logger.warn(f"  cleanup orphan duplicate models crashed: {exc!r}")
+            continue
+
+        # Rename takes BEFORE cleanup so we can pass the final take names
+        # straight to the cleanup pass (which limits its FCurve work to those
+        # takes and leaves previously imported takes untouched).
         target_stem = take_name_from_fbx_path(fbx_path)
+        imported_take_names: List[str] = []
         for i, take in enumerate(new_takes):
             stem = target_stem if i == 0 else f"{target_stem}_p{i:02d}"
             renamed = _apply_naming(stem, config.take_prefix, config.take_suffix)
             unique = unique_take_name(renamed, [t for t in all_take_names() if t != take.Name])
             rename_take(take, unique)
             created.append(unique)
+            imported_take_names.append(unique)
             logger.info(f"  -> take '{unique}'")
             _safe_call(hooks.get("post_import"), logger, "post_import", fbx_path, take)
             tr = TakeResult(
@@ -416,43 +455,124 @@ def _import_phase(
                 status="pending",
             )
             report.results.append(tr)
+
+        if config.cleanup_duplicate_bones:
+            try:
+                cleanup_duplicate_bones(
+                    diagnostics,
+                    source_character_name=config.source_character_name,
+                    take_names=imported_take_names,
+                    logger=logger,
+                )
+            except Exception as exc:
+                logger.warn(f"  cleanup_duplicate_bones crashed: {exc!r}")
     return created
 
 
 def _log_import_diagnostics(diagnostics: Dict, logger: Logger) -> None:
     """Summarise what the FBX merge did so users can spot mis-bindings.
 
-    The most useful signal is ``new_models``: if any source-rig bone
-    (Hips/Spine/...) shows up there it means the merge created a parallel
-    skeleton rather than binding animation onto the existing source rig --
-    usually a namespace mismatch the user can fix in MotionBuilder.
+    Key signals we surface:
+
+    * ``namespace_target`` / ``fbx_namespaces`` -- whether the remap had a
+      destination and what the FBX itself carried.
+    * ``new_models`` partitioned into:
+        - duplicates of existing source-rig bones (e.g. ``ball_l 1`` while
+          the rig already owns ``ball_l``). MoBu appends ``" <N>"`` to break
+          name clashes, so we strip that suffix before matching.
+        - everything else (likely UE-vs-MoBu naming mismatch, accessories,
+          weapons, IK helpers, etc.).
     """
     if not diagnostics:
         return
+
     namespace_target = diagnostics.get("namespace_target") or ""
     if namespace_target:
         logger.info(f"  namespace remap target: '{namespace_target}'")
+    else:
+        logger.info(
+            "  namespace remap target: (none - source character has no namespace)"
+        )
+
+    fbx_namespaces = diagnostics.get("fbx_namespaces") or []
+    if fbx_namespaces:
+        logger.info(f"  FBX internal namespaces: {fbx_namespaces}")
+    else:
+        logger.info("  FBX internal namespaces: (none reported)")
+
+    fbx_take_names = diagnostics.get("fbx_take_names") or []
+    if fbx_take_names:
+        logger.info(f"  FBX take names: {fbx_take_names}")
+    else:
+        logger.info("  FBX take names: (none reported)")
+
+    import_mode = diagnostics.get("import_mode") or ""
+    if import_mode:
+        logger.info(f"  import mode: {import_mode}")
+
+    reused_take = diagnostics.get("reused_existing_take") or ""
+    if reused_take:
+        logger.warn(
+            f"  merge reused existing take '{reused_take}' instead of creating a new one."
+        )
+
+    source_bones = list(diagnostics.get("source_bones") or [])
+    logger.info(
+        f"  source character bones in scene: {len(source_bones)} "
+        f"(sample: {source_bones[:6]})"
+    )
 
     new_models = diagnostics.get("new_models") or []
-    source_bones = set(diagnostics.get("source_bones") or [])
     if not new_models:
+        logger.info("  merge added 0 new model(s).")
         return
 
-    suspicious = []
+    # MotionBuilder breaks name clashes by appending " <N>" (single space
+    # followed by digits). Strip that so ``ball_l 1`` matches existing
+    # ``ball_l`` in source_bones.
+    suffix_re = re.compile(r"\s+\d+$")
+    source_bone_set = set(source_bones)
+
+    duplicates: Dict[str, List[str]] = {}
+    non_duplicates: List[str] = []
     for long_name in new_models:
         short = long_name.rsplit(":", 1)[-1]
-        if short in source_bones:
-            suspicious.append(long_name)
+        normalized = suffix_re.sub("", short)
+        if short in source_bone_set or normalized in source_bone_set:
+            duplicates.setdefault(normalized, []).append(long_name)
+        else:
+            non_duplicates.append(long_name)
 
     sample = new_models[:6]
     more = "" if len(new_models) <= 6 else f" (+{len(new_models) - 6} more)"
     logger.info(f"  merge added {len(new_models)} new model(s): {sample}{more}")
-    if suspicious:
+
+    if duplicates:
+        total_dup_models = sum(len(v) for v in duplicates.values())
         logger.warn(
-            "  merge created NEW bones that duplicate source-rig names "
-            f"({len(suspicious)} suspicious): {suspicious[:6]}. "
-            "Animation is going onto the duplicates, not the existing rig. "
-            "Likely cause: namespace mismatch between source character and FBX."
+            f"  {total_dup_models} new bone(s) duplicate {len(duplicates)} "
+            "existing source-rig bone name(s). Animation is keyed on the "
+            "duplicates, NOT the existing rig."
+        )
+        for original_name in list(duplicates.keys())[:10]:
+            dup_long_names = duplicates[original_name][:3]
+            logger.warn(f"    '{original_name}' duplicated as: {dup_long_names}")
+        if len(duplicates) > 10:
+            logger.warn(f"    ... (+{len(duplicates) - 10} more duplicated names)")
+        logger.warn(
+            "  Likely cause: namespace mismatch between the source character "
+            "and the FBX (or both share the same empty namespace, which forces "
+            "MoBu to suffix-rename instead of binding by LongName)."
+        )
+
+    if non_duplicates:
+        sample_nd = non_duplicates[:10]
+        more_nd = (
+            "" if len(non_duplicates) <= 10 else f" (+{len(non_duplicates) - 10} more)"
+        )
+        logger.info(
+            f"  {len(non_duplicates)} new bone(s) do NOT match any source "
+            f"character bone name: {sample_nd}{more_nd}"
         )
 
 
@@ -465,18 +585,20 @@ def _plot_phase(
     hooks: Dict[str, Callable],
     report: RunReport,
 ) -> None:
-    if config.match_source:
-        if not apply_match_source(target_char, True):
-            logger.warn("Match Source property not found on target; HIK defaults will be used.")
-
-    link_input(target_char, source_char)
-    try:
-        for tn in take_names:
-            take = get_take_by_name(tn)
-            if take is None:
-                logger.warn(f"Take '{tn}' disappeared before plot.")
-                continue
-            set_current_take(take)
+    match_source_warned = False
+    for tn in take_names:
+        take = get_take_by_name(tn)
+        if take is None:
+            logger.warn(f"Take '{tn}' disappeared before plot.")
+            continue
+        set_current_take(take)
+        _evaluate_scene()
+        if config.match_source:
+            if not apply_match_source(target_char, True) and not match_source_warned:
+                logger.warn("Match Source property not found on target; HIK defaults will be used.")
+                match_source_warned = True
+        link_input(target_char, source_char)
+        try:
             logger.info(f"Plotting take '{tn}' ...")
             _safe_call(hooks.get("pre_plot"), logger, "pre_plot", target_char, source_char, take)
             try:
@@ -503,8 +625,19 @@ def _plot_phase(
                 except Exception as exc:
                     logger.error(f"Root motion failed for '{tn}': {exc!r}")
                     _append_notes(report, tn, [f"root_motion error: {exc!r}"])
-    finally:
-        unbind_input(target_char)
+        finally:
+            unbind_input(target_char)
+            _evaluate_scene()
+
+
+def _evaluate_scene() -> None:
+    """Best-effort scene evaluation after changing takes or HIK input state."""
+    try:
+        from pyfbsdk import FBSystem  # type: ignore
+
+        FBSystem().Scene.Evaluate()
+    except Exception:
+        pass
 
 
 def _export_phase(
@@ -574,6 +707,7 @@ def _export_phase(
                 config=config.export,
                 metadata=metadata,
                 filename_override=final_name,
+                logger=logger,
             )
         except Exception as exc:
             logger.error(f"Export failed for '{tn}': {exc!r}")

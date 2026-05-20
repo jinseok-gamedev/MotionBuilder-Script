@@ -21,12 +21,14 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from pyfbsdk import (  # type: ignore
     FBApplication,
+    FBCharacterInputType,
     FBElementAction,
     FBFbxOptions,
     FBModelList,
@@ -45,6 +47,7 @@ from .take_manager import all_take_names, get_take_by_name, takes_added_since
 
 
 _METADATA_PROPERTY_NAME = "RetargetInfo"
+_EXPORT_OFFSET_ROOT_NAMES = {"root_offset", "root offset", "root-offset"}
 
 
 @dataclass
@@ -94,6 +97,81 @@ def _safe_user() -> str:
 # ----------------------------------------------------------------------------
 
 
+def _isolate_all_character_inputs() -> List[Tuple]:
+    """Disconnect every HIK character's live input and snapshot prior state.
+
+    MotionBuilder crashes inside ``FBApplication.FileMerge`` when the incoming
+    skeleton binds to slots of a character whose ``ActiveInput`` is True. The
+    repro is deterministic on a setting scene that hosts both a source and a
+    target HIK character; the same FBX merges cleanly via ``File > Merge`` and
+    via Python when no character is active.
+
+    Returns a list of ``(character, active, input_type, input_character)``
+    tuples to be passed verbatim to :func:`_restore_character_inputs`.
+
+    The ``InputCharacter = None`` assignment is intentionally NOT attempted
+    here: some MotionBuilder Python builds (Boost.Python) reject ``None`` with
+    ``Boost.Python.ArgumentError: None.None(FBCharacter, NoneType)``. Setting
+    ``ActiveInput = False`` and ``InputType = kFBCharacterInputStance`` is
+    enough to make the merge safe in practice.
+    """
+    snapshot: List[Tuple] = []
+    try:
+        characters = list(FBSystem().Scene.Characters)
+    except Exception:
+        return snapshot
+
+    for char in characters:
+        try:
+            active = bool(char.ActiveInput)
+        except Exception:
+            active = None
+        try:
+            itype = char.InputType
+        except Exception:
+            itype = None
+        try:
+            inchar = char.InputCharacter
+        except Exception:
+            inchar = None
+        snapshot.append((char, active, itype, inchar))
+        try:
+            char.ActiveInput = False
+        except Exception:
+            pass
+        try:
+            char.InputType = FBCharacterInputType.kFBCharacterInputStance
+        except Exception:
+            pass
+    return snapshot
+
+
+def _restore_character_inputs(snapshot: List[Tuple]) -> None:
+    """Inverse of :func:`_isolate_all_character_inputs`.
+
+    Restore InputCharacter first, then InputType, then ActiveInput so that the
+    final flip to active happens on a fully reattached input. Every step is
+    best-effort; failures are silently skipped because the merge is already
+    done and we should not block the caller on a cosmetic restore.
+    """
+    for char, active, itype, inchar in snapshot:
+        if inchar is not None:
+            try:
+                char.InputCharacter = inchar
+            except Exception:
+                pass
+        if itype is not None:
+            try:
+                char.InputType = itype
+            except Exception:
+                pass
+        if active is not None:
+            try:
+                char.ActiveInput = bool(active)
+            except Exception:
+                pass
+
+
 def import_animation_only(
     fbx_path: str,
     source_character_name: str = "",
@@ -128,9 +206,37 @@ def import_animation_only(
 
     pre_models = _snapshot_scene_model_names()
     snapshot = all_take_names()
+    # Snapshot each existing take's end time so we can tell which take MoBu
+    # piped animation onto when the merge does not create a new take (typical
+    # for binary FBXs whose internal take name already exists in the scene).
+    pre_take_durations = _snapshot_take_durations()
     app = FBApplication()
-    opts = _build_import_options(fbx_path, target_namespace=target_namespace)
-    success = app.FileMerge(fbx_path, False, opts)
+    use_raw_merge = not target_namespace
+
+    # Do not construct FBFbxOptions for no-namespace imports. Some valid FBXs
+    # crash MotionBuilder during FBFbxOptions(True, path) even though manual
+    # File > Merge succeeds. With an empty source namespace we do not need the
+    # options object for remapping, so use the raw merge path.
+    fbx_namespaces: List[str] = []
+    fbx_take_names = _scan_fbx_take_names(fbx_path)
+
+    # HIK characters with an active input cause MotionBuilder to crash inside
+    # FileMerge when the incoming bones bind to characterized slots (observed
+    # repro: a UE5 mannequin animation FBX merged into a scene with both a
+    # source and a target HIK character active). Disable every character's
+    # live input around the merge and restore it afterwards.
+    char_input_snapshot = _isolate_all_character_inputs()
+    try:
+        if use_raw_merge:
+            success = app.FileMerge(fbx_path, False)
+        else:
+            opts = _build_import_options(fbx_path, target_namespace=target_namespace)
+            fbx_namespaces = _collect_fbx_namespaces(opts)
+            if not fbx_take_names:
+                fbx_take_names = _collect_fbx_take_names(opts)
+            success = app.FileMerge(fbx_path, False, opts)
+    finally:
+        _restore_character_inputs(char_input_snapshot)
     if not success:
         raise IOError(f"FileMerge returned False for {fbx_path}")
 
@@ -140,8 +246,144 @@ def import_animation_only(
         diagnostics["new_models"] = new_models
         diagnostics["namespace_target"] = target_namespace
         diagnostics["source_bones"] = source_bones
+        diagnostics["fbx_namespaces"] = fbx_namespaces
+        diagnostics["fbx_take_names"] = fbx_take_names
+        diagnostics["import_mode"] = "raw_merge" if use_raw_merge else "options_merge"
 
-    return takes_added_since(snapshot)
+    new_takes = takes_added_since(snapshot)
+    if new_takes:
+        return new_takes
+
+    fallback_take = _resolve_existing_import_take(
+        snapshot, fbx_take_names, pre_take_durations
+    )
+    if fallback_take is not None:
+        if diagnostics is not None:
+            diagnostics["reused_existing_take"] = getattr(fallback_take, "Name", "")
+        return [fallback_take]
+
+    return []
+
+
+def _collect_fbx_take_names(opts: FBFbxOptions) -> List[str]:
+    """Return take names advertised by the FBX import options."""
+    out: List[str] = []
+    try:
+        for i in range(opts.GetTakeCount()):
+            try:
+                name = str(opts.GetTakeName(i) or "")
+            except Exception:
+                continue
+            if name:
+                out.append(name)
+    except Exception:
+        pass
+    return out
+
+
+def _scan_fbx_take_names(fbx_path: str) -> List[str]:
+    """Lightweight take-name scan that avoids MotionBuilder's FBX parser."""
+    try:
+        with open(fbx_path, "rb") as fh:
+            text = fh.read().decode("latin1", "ignore")
+    except Exception:
+        return []
+
+    out: List[str] = []
+    seen = set()
+    for pattern in (
+        r'Take:\s*"([^"]+)"',
+        r'AnimStack::([^"]+)"',
+        r'AnimationStack[^\n\r"]*"AnimStack::([^"]+)"',
+    ):
+        for match in re.finditer(pattern, text):
+            name = match.group(1).strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out
+
+
+def _snapshot_take_durations() -> Dict[str, float]:
+    """End-time (in seconds) of every take currently in the scene.
+
+    Used to detect which take a ``FileMerge`` piped animation onto when no
+    new take was created. By snapshotting durations before and after the
+    merge, any take whose end time changed must be the one that received
+    the incoming animation. This survives binary FBXs whose internal take
+    names we cannot sniff with the ASCII regex.
+    """
+    out: Dict[str, float] = {}
+    try:
+        takes = list(FBSystem().Scene.Takes)
+    except Exception:
+        return out
+    for take in takes:
+        try:
+            span = take.LocalTimeSpan
+            out[take.Name] = float(span.GetStop().GetSecondDouble())
+        except Exception:
+            continue
+    return out
+
+
+def _resolve_existing_import_take(
+    snapshot_names: Iterable[str],
+    fbx_take_names: List[str],
+    pre_take_durations: Optional[Dict[str, float]] = None,
+):
+    """Handle FBXs that merge animation into an existing/current take.
+
+    MotionBuilder sometimes does not create a new take when the incoming FBX
+    take name already exists in the scene. The animation is still merged onto
+    that existing take, so return it instead of treating the import as empty.
+
+    Resolution order, first match wins:
+
+    1. **FBX-advertised take name** (only useful for ASCII FBX or when the
+       options object successfully populated ``fbx_take_names``).
+    2. **Duration delta** -- any take whose LocalTimeSpan grew between
+       ``pre_take_durations`` and now. This is the robust path for binary
+       FBXs because it does not depend on string sniffing.
+    3. **Scene's current take** -- last-ditch fallback if MoBu silently piped
+       keys onto the active take without changing its time span.
+    """
+    snapshot = set(snapshot_names)
+
+    for take_name in fbx_take_names or []:
+        if take_name not in snapshot:
+            continue
+        take = get_take_by_name(take_name)
+        if take is not None:
+            return take
+
+    if pre_take_durations:
+        post = _snapshot_take_durations()
+        # Prefer the take whose duration grew the most: a 215s anim landing on
+        # a 1s placeholder is unmistakable, whereas tiny floating-point drift
+        # on unrelated takes should not win.
+        best_name: Optional[str] = None
+        best_delta = 1e-6
+        for name, after_end in post.items():
+            if name not in snapshot:
+                continue
+            before_end = pre_take_durations.get(name, 0.0)
+            delta = after_end - before_end
+            if delta > best_delta:
+                best_delta = delta
+                best_name = name
+        if best_name is not None:
+            take = get_take_by_name(best_name)
+            if take is not None:
+                return take
+
+    try:
+        current_take = FBSystem().CurrentTake
+    except Exception:
+        current_take = None
+    if current_take is not None and getattr(current_take, "Name", "") in snapshot:
+        return current_take
+    return None
 
 
 def _snapshot_scene_model_names() -> set:
@@ -174,7 +416,8 @@ def _walk_model_long_names(node, out: set) -> None:
 
 
 def _build_import_options(
-    fbx_path: str, target_namespace: str = ""
+    fbx_path: str,
+    target_namespace: str = "",
 ) -> FBFbxOptions:
     """Configure FBFbxOptions for an animation-only merge.
 
@@ -185,19 +428,19 @@ def _build_import_options(
     """
     opts = FBFbxOptions(True, fbx_path)
 
-    # Disable every category first; selectively re-enable what we need below.
-    try:
-        opts.SettingsByDefault(False)
-    except AttributeError:
-        pass
-
-    # Bring in animation curves and let them bind to existing bones by name.
+    # Keep MotionBuilder's default import profile close to manual File > Merge.
+    # Some FBXs crash MoBu when we first call SettingsByDefault(False) and then
+    # selectively re-enable categories. We still force the essentials below and
+    # discard non-animation scene clutter where the SDK exposes a stable flag.
     _set_action(opts, "Models", FBElementAction.kFBElementActionMerge)
     _set_bool(opts, "ModelsAnimation", True)
     _set_bool(opts, "BaseModelsAnimation", True)
     _set_bool(opts, "Animation", True)
 
-    # Everything else stays out of the setting file.
+    # Everything else stays out of the setting file when the option exists.
+    # Model geometry shares the Models bucket with skeletons in many MoBu
+    # versions, so meshes are ignored later by selection/export cleanup rather
+    # than by disabling Models here.
     for attr, action in (
         ("Lights", FBElementAction.kFBElementActionDiscard),
         ("Cameras", FBElementAction.kFBElementActionDiscard),
@@ -343,6 +586,450 @@ def _set_bool(opts: FBFbxOptions, name: str, value: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Post-merge duplicate cleanup
+# ----------------------------------------------------------------------------
+#
+# Why this exists
+# ---------------
+# When ``FileMerge`` runs ``kFBElementActionMerge`` for Models, MotionBuilder
+# binds incoming bones to existing scene models by **LongName** (full parent
+# path). If the FBX's hierarchy differs from the scene's source rig -- even
+# slightly, even when short names and namespaces match -- the merger gives up
+# and appends ``" <N>"`` (single space + digit) to the new bone's short name
+# to break the clash. The animation lands on those duplicates, so the source
+# HumanIK character (still slotted on the originals) sees an empty rig at
+# plot time.
+#
+# We can't fix the merge after the fact, but we can:
+# 1. Detect the duplicates (trailing " <N>" suffix + a name that matches an
+#    existing source-character bone).
+# 2. Copy translation/rotation/scaling FCurves from each duplicate back onto
+#    the matching original, for every take that was added by the import.
+# 3. Delete the duplicate model and its descendants (which absorbs the "20
+#    new bones that don't match" group too: ik_foot_l 1, ik_hand_l 1, etc.,
+#    because they're parented under the duplicates).
+
+_DUP_SUFFIX_RE = re.compile(r"^(.+?)(\s+\d+)$")
+
+
+def cleanup_duplicate_bones(
+    diagnostics: Dict,
+    source_character_name: str = "",
+    take_names: Optional[List[str]] = None,
+    logger=None,
+) -> Dict[str, int]:
+    """Transfer animation off ``" <N>"``-renamed duplicates back to source bones.
+
+    ``diagnostics`` must be the dict populated by :func:`import_animation_only`
+    (it carries ``new_models`` and ``source_bones``).
+
+    ``take_names`` limits which takes are processed; defaults to every take
+    currently in the scene. In typical use the caller passes only the takes
+    that the latest import created, so previously-imported takes are left
+    alone.
+
+    Returns ``{"transferred": int, "deleted": int, "skipped": int}``.
+    """
+    result = {"transferred": 0, "deleted": 0, "skipped": 0}
+
+    new_models = list(diagnostics.get("new_models") or [])
+    source_bones = list(diagnostics.get("source_bones") or [])
+    if not new_models or not source_bones:
+        return result
+
+    source_bone_set = set(source_bones)
+
+    candidate_pairs: List[Tuple[str, str]] = []
+    for long_name in new_models:
+        short = long_name.rsplit(":", 1)[-1]
+        match = _DUP_SUFFIX_RE.match(short)
+        if not match:
+            continue
+        original_short = match.group(1)
+        if original_short in source_bone_set:
+            candidate_pairs.append((long_name, original_short))
+
+    if not candidate_pairs:
+        if logger is not None:
+            logger.info("  cleanup: no duplicates to clean.")
+        return result
+
+    source_char = (
+        find_character_by_name(source_character_name) if source_character_name else None
+    )
+    src_bone_map: Dict[str, object] = {}
+    if source_char is not None:
+        for m in get_target_skeleton_models(source_char):
+            name = getattr(m, "Name", "") or ""
+            if name and name not in src_bone_map:
+                src_bone_map[name] = m
+
+    system = FBSystem()
+    if take_names is None:
+        takes_to_process = list(system.Scene.Takes)
+    else:
+        wanted = set(take_names)
+        takes_to_process = [t for t in system.Scene.Takes if t.Name in wanted]
+
+    if not takes_to_process:
+        if logger is not None:
+            logger.warn("  cleanup: no takes resolved; nothing to transfer.")
+        return result
+
+    duplicates_to_delete: List[object] = []
+    prev_take = system.CurrentTake
+
+    # We dump verbose anim-state diagnostics for the FIRST resolved pair only;
+    # otherwise the log explodes (88 bones * 3 props * N takes). Once that one
+    # dump is in the log the user (or us) can see why transfer is returning
+    # nothing.
+    verbose_dumped = False
+
+    try:
+        for dup_long_name, original_short in candidate_pairs:
+            dup_model = _find_model_by_long_name(dup_long_name)
+            original_model = src_bone_map.get(original_short)
+
+            if dup_model is None or original_model is None:
+                result["skipped"] += 1
+                continue
+
+            is_first_pair = not verbose_dumped
+            if is_first_pair and logger is not None:
+                verbose_dumped = True
+                _diagnose_anim_state(dup_model, original_model, takes_to_process, logger)
+
+            transferred_any_take = False
+            for tk_idx, take in enumerate(takes_to_process):
+                system.CurrentTake = take
+                # Verbose-log the first pair's first take only; otherwise log
+                # volume blows up to 88 * num_takes entries per import.
+                v_logger = logger if (is_first_pair and tk_idx == 0) else None
+                try:
+                    if _transfer_anim_curves(
+                        dup_model, original_model, verbose_logger=v_logger
+                    ):
+                        transferred_any_take = True
+                except Exception as exc:
+                    if logger is not None:
+                        logger.warn(
+                            f"  cleanup: transfer failed on '{dup_long_name}' "
+                            f"take '{take.Name}': {exc!r}"
+                        )
+
+            if transferred_any_take:
+                result["transferred"] += 1
+            duplicates_to_delete.append(dup_model)
+    finally:
+        if prev_take is not None:
+            try:
+                system.CurrentTake = prev_take
+            except Exception:
+                pass
+
+    for dup_model in duplicates_to_delete:
+        try:
+            result["deleted"] += _delete_model_subtree(dup_model)
+        except Exception as exc:
+            if logger is not None:
+                logger.warn(f"  cleanup: delete failed: {exc!r}")
+
+    if logger is not None:
+        logger.info(
+            "  cleanup: transferred animation on "
+            f"{result['transferred']} bone(s), deleted {result['deleted']} "
+            f"model(s), skipped {result['skipped']}."
+        )
+    return result
+
+
+def delete_duplicate_bone_models(
+    diagnostics: Dict,
+    logger=None,
+) -> Dict[str, int]:
+    """Delete duplicate models from a merge that did not create usable takes.
+
+    Some FBX files merge a skeleton into the scene but do not add a take. In
+    that case there is no imported take to transfer animation from, but leaving
+    the duplicate skeleton in the scene can destabilize the next HIK plot.
+    """
+    result = {"deleted": 0, "skipped": 0}
+    new_models = list(diagnostics.get("new_models") or [])
+    source_bones = set(diagnostics.get("source_bones") or [])
+    if not new_models or not source_bones:
+        return result
+
+    duplicates_to_delete: List[object] = []
+    for long_name in new_models:
+        short = long_name.rsplit(":", 1)[-1]
+        match = _DUP_SUFFIX_RE.match(short)
+        if not match or match.group(1) not in source_bones:
+            continue
+        dup_model = _find_model_by_long_name(long_name)
+        if dup_model is None:
+            result["skipped"] += 1
+            continue
+        duplicates_to_delete.append(dup_model)
+
+    seen = set()
+    for dup_model in duplicates_to_delete:
+        key = id(dup_model)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            result["deleted"] += _delete_model_subtree(dup_model)
+        except Exception as exc:
+            result["skipped"] += 1
+            if logger is not None:
+                logger.warn(f"  cleanup: orphan delete failed: {exc!r}")
+
+    if logger is not None:
+        logger.info(
+            "  cleanup: deleted "
+            f"{result['deleted']} orphan duplicate model(s), "
+            f"skipped {result['skipped']}."
+        )
+    return result
+
+
+def _find_model_by_long_name(long_name: str):
+    """Walk the scene tree once looking for a model with this exact LongName."""
+    root = FBSystem().Scene.RootModel
+    if root is None:
+        return None
+    return _walk_find_long_name(root, long_name)
+
+
+def _walk_find_long_name(node, target: str):
+    try:
+        children = list(node.Children)
+    except Exception:
+        return None
+    for c in children:
+        try:
+            if c.LongName == target:
+                return c
+        except Exception:
+            pass
+        found = _walk_find_long_name(c, target)
+        if found is not None:
+            return found
+    return None
+
+
+def _fcurve_key_count(fc) -> int:
+    """Return key count from an ``FBFCurve`` across MoBu binding variants.
+
+    Different MoBu / pyfbsdk releases expose the underlying ``Keys``
+    collection differently:
+
+    * Older versions: ``fc.Keys.GetCount()`` (C++-style)
+    * Most versions:  ``len(fc.Keys)``
+    * Some bindings:  ``fc.KeyGetCount()`` flat method on FCurve
+
+    We probe each until one returns a number. Returns ``-1`` if every probe
+    failed, which the caller treats as "skip this curve".
+    """
+    if fc is None:
+        return -1
+    try:
+        return int(fc.Keys.GetCount())
+    except Exception:
+        pass
+    try:
+        return int(len(fc.Keys))
+    except Exception:
+        pass
+    try:
+        return int(fc.KeyGetCount())
+    except Exception:
+        pass
+    return -1
+
+
+def _fcurve_get_key(fc, idx):
+    """Index into an ``FBFCurve`` portably across MoBu binding variants."""
+    if fc is None:
+        return None
+    try:
+        return fc.Keys[idx]
+    except Exception:
+        pass
+    try:
+        return fc.KeyGet(idx)
+    except Exception:
+        pass
+    return None
+
+
+def _diagnose_anim_state(dup_model, original_model, takes, logger) -> None:
+    """Dump T/R/S animation state of one duplicate/original pair to the log.
+
+    Helps us see *why* a transfer ends up copying zero keys. We only run this
+    against the first pair so the log stays readable; once it tells us which
+    layer is empty (prop missing, IsAnimated False, anim node None, sub-nodes
+    empty, or FCurve key count zero) we know whether the issue is on the
+    MoBu API surface (version difference) or on the actual data (e.g. keys
+    live on Lcl* aliases instead of Translation/Rotation/Scaling, or driven
+    by a constraint).
+    """
+    logger.info(f"  cleanup verbose: src='{dup_model.LongName}' dst='{original_model.LongName}'")
+    system = FBSystem()
+
+    inspect_takes = takes[:1] if takes else []
+    for take in inspect_takes:
+        try:
+            system.CurrentTake = take
+        except Exception:
+            pass
+        take_label = getattr(take, "Name", "?")
+        logger.info(f"    take='{take_label}':")
+        for prop_name in ("Translation", "Rotation", "Scaling"):
+            for label, model in (("src", dup_model), ("dst", original_model)):
+                prop = getattr(model, prop_name, None)
+                if prop is None:
+                    logger.info(f"      {label}.{prop_name}: <missing>")
+                    continue
+                try:
+                    is_anim = bool(prop.IsAnimated())
+                except Exception as exc:
+                    logger.info(f"      {label}.{prop_name}: IsAnimated() raised {exc!r}")
+                    continue
+                if not is_anim:
+                    logger.info(f"      {label}.{prop_name}: not animated")
+                    continue
+                node = prop.GetAnimationNode()
+                if node is None:
+                    logger.info(f"      {label}.{prop_name}: anim node is None")
+                    continue
+                try:
+                    subs = list(node.Nodes)
+                except Exception as exc:
+                    logger.info(f"      {label}.{prop_name}: node.Nodes raised {exc!r}")
+                    continue
+                key_counts: List[str] = []
+                for sub in subs:
+                    fc = getattr(sub, "FCurve", None)
+                    if fc is None:
+                        key_counts.append("noFC")
+                        continue
+                    count = _fcurve_key_count(fc)
+                    key_counts.append("?" if count < 0 else str(count))
+                logger.info(
+                    f"      {label}.{prop_name}: animated, "
+                    f"{len(subs)} sub-nodes, keys={key_counts}"
+                )
+
+
+def _transfer_anim_curves(src_model, dst_model, verbose_logger=None) -> bool:
+    """Copy T/R/S FCurves from ``src_model`` to ``dst_model`` in the current take.
+
+    Only Time/Value pairs are copied. Tangent metadata (mode, derivatives) is
+    intentionally NOT copied so we don't have to translate between MoBu API
+    surfaces that differ across versions; the plot step downstream will
+    rebuild interpolation curves anyway.
+
+    ``verbose_logger`` (optional): if supplied, every step that aborts the
+    copy emits a log line so we can see exactly which API surface failed
+    instead of swallowing the exception in a bare ``except``.
+
+    Returns True iff at least one curve had keys copied.
+    """
+    def _v(msg: str) -> None:
+        if verbose_logger is not None:
+            verbose_logger.info(f"      transfer: {msg}")
+
+    any_copied = False
+    for prop_name in ("Translation", "Rotation", "Scaling"):
+        src_prop = getattr(src_model, prop_name, None)
+        dst_prop = getattr(dst_model, prop_name, None)
+        if src_prop is None or dst_prop is None:
+            _v(f"{prop_name}: prop missing (src={src_prop is not None}, dst={dst_prop is not None})")
+            continue
+        try:
+            if not src_prop.IsAnimated():
+                _v(f"{prop_name}: src not animated")
+                continue
+        except Exception as exc:
+            _v(f"{prop_name}: src.IsAnimated raised {exc!r}")
+            continue
+        try:
+            if not dst_prop.IsAnimated():
+                dst_prop.SetAnimated(True)
+        except Exception as exc:
+            _v(f"{prop_name}: dst.SetAnimated raised {exc!r}")
+            continue
+
+        src_node = src_prop.GetAnimationNode()
+        dst_node = dst_prop.GetAnimationNode()
+        if src_node is None or dst_node is None:
+            _v(f"{prop_name}: anim node None (src={src_node is not None}, dst={dst_node is not None})")
+            continue
+        try:
+            src_subs = list(src_node.Nodes)
+            dst_subs = list(dst_node.Nodes)
+        except Exception as exc:
+            _v(f"{prop_name}: node.Nodes raised {exc!r}")
+            continue
+
+        # XYZ channels live as child animation nodes (3 each for T/R/S).
+        for i in range(min(len(src_subs), len(dst_subs))):
+            src_fc = getattr(src_subs[i], "FCurve", None)
+            dst_fc = getattr(dst_subs[i], "FCurve", None)
+            if src_fc is None or dst_fc is None:
+                _v(f"{prop_name}[{i}]: FCurve attr missing (src={src_fc is not None}, dst={dst_fc is not None})")
+                continue
+            key_count = _fcurve_key_count(src_fc)
+            if key_count < 0:
+                _v(f"{prop_name}[{i}]: src key_count probe failed")
+                continue
+            if key_count == 0:
+                _v(f"{prop_name}[{i}]: src has 0 keys")
+                continue
+            try:
+                dst_fc.EditClear()
+            except Exception:
+                try:
+                    dst_fc.KeyClear()
+                except Exception:
+                    pass
+            copied_this_curve = 0
+            for k_idx in range(key_count):
+                src_key = _fcurve_get_key(src_fc, k_idx)
+                if src_key is None:
+                    continue
+                try:
+                    dst_fc.KeyAdd(src_key.Time, float(src_key.Value))
+                    copied_this_curve += 1
+                    any_copied = True
+                except Exception as exc:
+                    if k_idx == 0:
+                        _v(f"{prop_name}[{i}]: KeyAdd raised {exc!r}")
+                    continue
+            if copied_this_curve > 0:
+                _v(f"{prop_name}[{i}]: copied {copied_this_curve}/{key_count} keys")
+    return any_copied
+
+
+def _delete_model_subtree(model) -> int:
+    """Recursively destroy ``model`` and every descendant. Returns count deleted."""
+    count = 0
+    try:
+        children = list(model.Children)
+    except Exception:
+        children = []
+    for c in children:
+        count += _delete_model_subtree(c)
+    try:
+        model.FBDelete()
+        count += 1
+    except Exception:
+        pass
+    return count
+
+
+# ----------------------------------------------------------------------------
 # Metadata injection
 # ----------------------------------------------------------------------------
 
@@ -419,12 +1106,16 @@ def export_take_to_fbx(
     config: Optional[ExportConfig] = None,
     metadata: Optional[ExportMetadata] = None,
     filename_override: Optional[str] = None,
+    logger=None,
 ) -> str:
     """Save ``take_name`` to ``<out_dir>/<take_name>.fbx``.
 
     Only the target character's skeleton bones are selected; the source rig,
     helper geometry, lights, etc. are excluded so the output FBX is small and
-    targeted at downstream DCC import.
+    targeted at downstream DCC import. To preserve hierarchy, every ancestor
+    of an HIK-slotted bone is also pulled into the selection (otherwise a
+    non-HIK intermediate bone like a Biped ``pelvis`` would drop out and its
+    children would be re-parented to the scene root on save).
 
     Returns the absolute path that was written.
 
@@ -452,6 +1143,14 @@ def export_take_to_fbx(
     prev_selection_snapshot = _snapshot_selection()
     _clear_selection()
     _select_models(skeleton)
+    added_ancestors = _select_ancestors(skeleton)
+    added_offset_models = _select_offset_root_subtrees(skeleton)
+    if logger is not None:
+        logger.info(
+            f"  export: {len(skeleton)} HIK-slotted bone(s) selected, "
+            f"+{len(added_ancestors)} ancestor(s) added to preserve hierarchy, "
+            f"+{len(added_offset_models)} root_Offset subtree model(s)."
+        )
 
     if metadata is not None and skeleton:
         inject_metadata(skeleton[0], metadata)
@@ -495,6 +1194,124 @@ def _select_models(models: Iterable) -> None:
             m.Selected = True
         except Exception:
             continue
+
+
+def _select_ancestors(models: Iterable) -> List:
+    """Walk each model's parent chain and select every ancestor along the way.
+
+    Why this exists
+    ---------------
+    ``export_take_to_fbx`` uses ``SaveSelectedModelsOnly=True``, which only
+    serialises the bones that are currently selected. ``get_target_skeleton_models``
+    returns just the bones that are wired into HumanIK slots (Hips, Spine,
+    LeftUpLeg, ...). If a non-HIK intermediate bone sits between two HIK
+    bones in the skeleton tree -- e.g. a Biped ``pelvis`` that isn't slotted
+    on the character -- it gets dropped from the export and its children
+    lose their parent connection. MoBu then re-parents the orphans to the
+    scene root on save, producing the flattened ``Bip_001 / Spine /
+    L Thigh / R Thigh`` hierarchy the user observed.
+
+    Selecting every ancestor up to (but not including) the scene root
+    preserves the full chain. Returns the list of ancestor models that were
+    actually selected (for diagnostics / logging).
+    """
+    try:
+        scene_root = FBSystem().Scene.RootModel
+    except Exception:
+        scene_root = None
+
+    seen = set()
+    added: List = []
+    for m in models:
+        cur = getattr(m, "Parent", None)
+        while cur is not None and cur is not scene_root:
+            key = id(cur)
+            if key in seen:
+                break
+            seen.add(key)
+            try:
+                if not cur.Selected:
+                    cur.Selected = True
+                    added.append(cur)
+            except Exception:
+                pass
+            cur = getattr(cur, "Parent", None)
+    return added
+
+
+def _select_offset_root_subtrees(skeleton: Iterable) -> List:
+    """Select any ``root_Offset`` subtree that owns the target skeleton.
+
+    A manually added parent offset is a common way to correct axis orientation
+    without touching the characterized bones. HIK slots do not know about that
+    helper, so explicitly include its whole subtree when it is an ancestor of
+    the target skeleton; otherwise the exported FBX can lose the correction.
+    """
+    skeleton_list = [m for m in skeleton if m is not None]
+    if not skeleton_list:
+        return []
+
+    added: List = []
+    for candidate in _find_models_by_short_names(_EXPORT_OFFSET_ROOT_NAMES):
+        if not _model_contains_any(candidate, skeleton_list):
+            continue
+        _select_subtree(candidate, added)
+    return added
+
+
+def _find_models_by_short_names(names: Iterable[str]) -> List:
+    wanted = {n.lower() for n in names}
+    root = FBSystem().Scene.RootModel
+    if root is None:
+        return []
+    out: List = []
+    _walk_collect_by_short_name(root, wanted, out)
+    return out
+
+
+def _walk_collect_by_short_name(node, names: set, out: List) -> None:
+    try:
+        children = list(node.Children)
+    except Exception:
+        return
+    for child in children:
+        short = str(getattr(child, "Name", "") or "").lower()
+        if short in names:
+            out.append(child)
+        _walk_collect_by_short_name(child, names, out)
+
+
+def _model_contains_any(root_model, targets: Iterable) -> bool:
+    target_ids = {id(m) for m in targets}
+    return _walk_contains_any(root_model, target_ids)
+
+
+def _walk_contains_any(node, target_ids: set) -> bool:
+    if id(node) in target_ids:
+        return True
+    try:
+        children = list(node.Children)
+    except Exception:
+        return False
+    for child in children:
+        if _walk_contains_any(child, target_ids):
+            return True
+    return False
+
+
+def _select_subtree(root_model, added: List) -> None:
+    try:
+        if not root_model.Selected:
+            root_model.Selected = True
+            added.append(root_model)
+    except Exception:
+        pass
+    try:
+        children = list(root_model.Children)
+    except Exception:
+        return
+    for child in children:
+        _select_subtree(child, added)
 
 
 def _snapshot_selection() -> List:
