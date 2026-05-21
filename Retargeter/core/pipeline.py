@@ -298,11 +298,18 @@ def run(
     config: RunConfig,
     logger: Optional[Logger] = None,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> RunReport:
     """Execute the full retargeting pipeline.
 
     ``progress_cb`` receives ``(done, total, message)`` after each take phase
     so UIs can drive a progress bar without coupling to MotionBuilder.
+
+    ``cancel_check`` is an optional zero-arg callable returning ``True`` when
+    the operator has requested cancellation. It is polled at the start of
+    each take iteration of every phase; the *currently* running take is
+    allowed to finish so the scene is left in a consistent state, then the
+    pipeline returns early with whatever ``RunReport`` it has so far.
     """
     logger = logger or Logger()
     report = RunReport(config=config)
@@ -318,7 +325,7 @@ def run(
             logger.warn(f"Could not open log file: {exc!r}")
 
     try:
-        return _run_inner(config, logger, hooks, report, progress_cb)
+        return _run_inner(config, logger, hooks, report, progress_cb, cancel_check)
     finally:
         if log_path:
             csv_path = log_path.replace(".txt", ".csv")
@@ -330,12 +337,26 @@ def run(
         logger.close_file()
 
 
+def _is_cancelled(cancel_check: Optional[Callable[[], bool]], logger: Logger) -> bool:
+    """Safely poll the cancel callback; never crash the run on a buggy cb."""
+    if cancel_check is None:
+        return False
+    try:
+        if cancel_check():
+            logger.warn("Cancellation requested by user; stopping at next safe point.")
+            return True
+    except Exception as exc:
+        logger.warn(f"cancel_check crashed: {exc!r}")
+    return False
+
+
 def _run_inner(
     config: RunConfig,
     logger: Logger,
     hooks: Dict[str, Callable],
     report: RunReport,
     progress_cb: Optional[Callable[[int, int, str], None]],
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> RunReport:
     logger.info(
         f"Retarget run | source='{config.source_character_name}' "
@@ -365,7 +386,7 @@ def _run_inner(
         logger.info("Clean import: removing existing takes...")
         clean_all_takes()
 
-    created_takes = _import_phase(config, logger, hooks, report)
+    created_takes = _import_phase(config, logger, hooks, report, cancel_check)
     if not created_takes and config.take_plans and config.out_dir:
         selected_takes = [tp.take_name for tp in config.take_plans if tp.export]
         if not selected_takes:
@@ -383,14 +404,14 @@ def _run_inner(
                         status="pending",
                     )
                 )
-        _export_phase(config, target_char, selected_takes, logger, hooks, report, progress_cb)
+        _export_phase(config, target_char, selected_takes, logger, hooks, report, progress_cb, cancel_check)
         return report
     if not created_takes:
         logger.warn("No takes were created; nothing to plot.")
         return report
 
-    _plot_phase(config, source_char, target_char, created_takes, logger, hooks, report)
-    _export_phase(config, target_char, created_takes, logger, hooks, report, progress_cb)
+    _plot_phase(config, source_char, target_char, created_takes, logger, hooks, report, cancel_check)
+    _export_phase(config, target_char, created_takes, logger, hooks, report, progress_cb, cancel_check)
 
     return report
 
@@ -400,10 +421,13 @@ def _import_phase(
     logger: Logger,
     hooks: Dict[str, Callable],
     report: RunReport,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> List[str]:
     """Import each source FBX as new take(s). Returns final take names."""
     created: List[str] = []
     for fbx_path in config.fbx_files:
+        if _is_cancelled(cancel_check, logger):
+            return created
         logger.info(f"Importing: {fbx_path}")
         _safe_call(hooks.get("pre_import"), logger, "pre_import", fbx_path)
         diagnostics: Dict = {}
@@ -584,9 +608,12 @@ def _plot_phase(
     logger: Logger,
     hooks: Dict[str, Callable],
     report: RunReport,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> None:
     match_source_warned = False
     for tn in take_names:
+        if _is_cancelled(cancel_check, logger):
+            return
         take = get_take_by_name(tn)
         if take is None:
             logger.warn(f"Take '{tn}' disappeared before plot.")
@@ -648,6 +675,7 @@ def _export_phase(
     hooks: Dict[str, Callable],
     report: RunReport,
     progress_cb: Optional[Callable[[int, int, str], None]],
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> None:
     if not config.out_dir:
         logger.warn("No output directory set; skipping export phase.")
@@ -661,6 +689,8 @@ def _export_phase(
 
     total = len(to_export)
     for i, tn in enumerate(to_export):
+        if _is_cancelled(cancel_check, logger):
+            return
         if progress_cb is not None:
             try:
                 progress_cb(i, total, f"Exporting {tn}")

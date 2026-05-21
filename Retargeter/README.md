@@ -32,8 +32,11 @@ Retargeter/
     pipeline.py               # orchestration: hooks, dry-run, logging, isolation
     logger.py                 # tee logger (console + file + UI)
   ui/
-    main_panel.py             # PySide2 main panel
-    take_table.py             # per-take checkboxes + root motion combo
+    main_panel.py             # PySide2/6 main panel (split layout, toolbar, action bar)
+    options_dialog.py         # modeless options dialog (sidebar + paged + presets)
+    take_table.py             # per-take checkboxes + root motion combo + status filter
+    file_list.py              # drag&drop FBX list with context menu
+    log_view.py               # colored severity-aware log viewer
     _qt_helpers.py
   config/
     default_settings.json     # default plot rate, fbx version, naming, etc.
@@ -112,28 +115,95 @@ show_panel()
 
 The panel can be left open while you swap setting files between runs.
 
+## Panel anatomy
+
+```
+Menu (File / Option / Run / Help)
+Toolbar (Engine preset, Settings, Open output, Refresh, ready dot)
++-------------------------+-----------------------------------+
+| Setup (left)            | Run & Review (right)              |
+|  HumanIK Characters     |   Takes table (filter / sort /    |
+|   src / arrow / tgt     |     status colors / context menu) |
+|  Source FBX files       |   Combined action row:            |
+|   (drag & drop list)    |    [Check][Uncheck][Apply..]      |
+|  Output folder          |    ... [Dry-run][Import & Plot]   |
+|                         |    [Export][Run All*][Cancel]     |
+|                         |   Progress bar (full width)       |
+|                         |   Log panel (Clear button)        |
++-------------------------+-----------------------------------+
+```
+
+`*` = primary action; **Cancel** only appears while a run is in progress.
+Current take name is rendered inside the progress bar text.
+
 ## Panel workflow
 
 1. Open the setting FBX for the case you want.
 2. Run the script -- the panel appears.
-3. Click **Refresh** in the HumanIK Characters section. Choose the Source
-   and Target combos.
-4. **Add files...** or **Add folder...** to populate the Source FBX list.
-5. (Optional) Tweak options: plot rate, root motion mode, take prefix/suffix,
-   FBX version, etc.
-6. **Dry-run** to preview what take names and output paths would be created
+3. Click **Refresh** (toolbar or inline arrow next to the Source combo)
+   and pick the Source / Target HumanIK characters. The little arrow
+   between them swaps the two.
+4. Populate the Source FBX list. Three options:
+   - drag FBX files **or** folders straight onto the list from the OS
+     file manager;
+   - **Add files...** / **Add folder...** buttons (or **File** menu);
+   - paste paths via custom hooks if you have a pipeline.
+5. (Optional) **Option > Settings...** to tweak per-run options
+   (plot rate, root motion, naming, FBX version, ...). The dialog is
+   modeless: leave it open while you run.
+6. Set the **Output folder** in the left column.
+7. **Dry-run** to preview which takes / output paths would be produced
    without touching the scene.
-7. **Import & Plot** to actually merge animations, plot them onto the target,
-   and apply any root motion mode.
-8. Review the take table -- uncheck takes you do not want exported, override
-   per-row root motion if needed.
-9. Set the **Output** folder.
-10. **Export Selected Takes**. The script writes one FBX per take into the
-    output folder along with a timestamped `_retarget_log_<...>.txt` and a
-    matching `.csv` manifest.
+8. **Run All** to do import, plot, and export back-to-back.
+   Or split it: **Import & Plot** first, review the take table, then
+   **Export Selected**.
+9. While running: the progress bar shows the current take name; the log
+   panel colours error/warn lines; **Cancel** stops at the next safe
+   take boundary (best responsiveness during Export).
+10. On success a confirmation box offers **Open output folder**.
 
-For a one-click flow use **Run All** which performs import, plot, and export
-back-to-back using the current options.
+## Take table tips
+
+- Right-click a row for **Reveal source in file explorer**,
+  **Copy source path**, **Copy take name**, **Remove row**.
+- The **Filter** combo at the top of the table shows only rows with a
+  given status (e.g. just the `failed` ones after a noisy run).
+- Failed rows are tinted red, OK rows tinted green, so you can scan a
+  long table at a glance.
+
+## Keyboard shortcuts
+
+- `Ctrl+O` -- Add FBX files...
+- `Ctrl+Shift+O` -- Add folder...
+- `Delete` -- Remove selected files
+- `Ctrl+L` -- Clear file list
+- `Ctrl+,` -- Open the Options dialog
+- `Ctrl+R` -- Run All
+- `Ctrl+P` -- Import & Plot only
+- `Ctrl+E` -- Export selected takes
+- `Ctrl+D` -- Dry-run
+- `Esc` -- Cancel running
+- `F5` -- Refresh HumanIK character list
+- `Ctrl+W` -- Close panel
+
+## Presets
+
+`Option > Settings... > Presets` saves the entire option set under a
+name. Presets are stored per-user in `QSettings` (Windows registry under
+``HKCU\\Software\\Retargeter`` or the platform equivalent), not in the
+repo, so each operator keeps their own list. Use **Save Current As...**
+to capture the current values, then **Load** to switch between
+``UE5_to_Maya`` / ``Max_to_UE5`` / experimental tweaks instantly.
+
+## State persistence
+
+The panel restores the following on next launch (per user, via
+`QSettings`):
+
+- window geometry and splitter ratios
+- output folder
+- engine preset
+- last opened "Add files..." and "Add folder..." directories
 
 ## Options reference
 
@@ -162,9 +232,10 @@ back-to-back using the current options.
   `overwrite` clobbers; `skip` leaves the file alone.
 - **FBX version** -- target FBX SDK version of the exported file.
 - **ASCII FBX** -- text FBX instead of the default binary.
-- **Engine preset** -- informational tag stored in the metadata; no
-  geometric transform applied yet (reserved for future engine-specific
-  axis / unit handling).
+- **Engine preset** (toolbar) -- informational tag stored in the metadata;
+  no geometric transform applied yet (reserved for future engine-specific
+  axis / unit handling). Lives on the top toolbar rather than in the
+  Options dialog because it is the single most frequently changed control.
 
 ## Root motion modes
 
