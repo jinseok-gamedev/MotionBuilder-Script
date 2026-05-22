@@ -472,6 +472,19 @@ class OptionsDialog(QtWidgets.QDialog):
         self.chk_ascii = QtWidgets.QCheckBox("ASCII FBX")
         v.addWidget(self.chk_ascii)
 
+        self.chk_strip_namespace = QtWidgets.QCheckBox(
+            "Strip namespace from exported bone names"
+        )
+        self.chk_strip_namespace.setToolTip(
+            "Remove every '<ns>:' prefix from exported skeleton bones so the "
+            "output FBX lands with clean short names (pelvis, hand_l, ...) "
+            "instead of the in-scene 'Camp4:pelvis' form. The in-scene rig "
+            "is left untouched: namespaces are re-attached right after "
+            "FileSave finishes. Turn off only if a downstream consumer "
+            "depends on the source-scene namespace being baked into the FBX."
+        )
+        v.addWidget(self.chk_strip_namespace)
+
         self.chk_inject_metadata = QtWidgets.QCheckBox("Inject metadata into FBX")
         v.addWidget(self.chk_inject_metadata)
 
@@ -715,6 +728,7 @@ class OptionsDialog(QtWidgets.QDialog):
             "export": {
                 "fbx_version": self.cmb_fbx_version.currentText(),
                 "ascii": self.chk_ascii.isChecked(),
+                "strip_namespace_on_export": self.chk_strip_namespace.isChecked(),
                 "filename_template": self.txt_filename_template.text() or "{take}",
                 "on_conflict": self.cmb_on_conflict.currentText(),
             },
@@ -768,6 +782,9 @@ class OptionsDialog(QtWidgets.QDialog):
         export = settings.get("export") or {}
         self.cmb_fbx_version.setCurrentText(str(export.get("fbx_version", "FBX201800")))
         self.chk_ascii.setChecked(bool(export.get("ascii", False)))
+        self.chk_strip_namespace.setChecked(
+            bool(export.get("strip_namespace_on_export", True))
+        )
         self.txt_filename_template.setText(str(export.get("filename_template", "{take}")))
         self.cmb_on_conflict.setCurrentText(str(export.get("on_conflict", "increment")))
 

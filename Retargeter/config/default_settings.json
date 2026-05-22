@@ -36,6 +36,7 @@
         "save_character": false,
         "save_control_set": false,
         "save_character_extension": false,
+        "strip_namespace_on_export": true,
         "filename_template": "{take}",
         "on_conflict": "increment"
     },

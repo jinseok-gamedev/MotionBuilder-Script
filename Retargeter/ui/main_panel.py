@@ -802,6 +802,7 @@ class RetargeterPanel(QtWidgets.QWidget):
         export = ExportConfig(
             fbx_version=opt.cmb_fbx_version.currentText(),
             ascii=opt.chk_ascii.isChecked(),
+            strip_namespace_on_export=opt.chk_strip_namespace.isChecked(),
         )
         hik_options = {
             key: chk.isChecked() for key, chk in opt.chk_hik.items()

@@ -32,6 +32,7 @@ from pyfbsdk import (  # type: ignore
     FBElementAction,
     FBFbxOptions,
     FBModelList,
+    FBNamespaceAction,
     FBPropertyType,
     FBSystem,
     FBTake,
@@ -1517,6 +1518,13 @@ class ExportConfig:
     save_character: bool = False  # the character def lives in the setting file
     save_control_set: bool = False
     save_character_extension: bool = False
+    # Strip every ``<ns>:`` namespace prefix from the exported skeleton's
+    # bone names so the output FBX lands with clean ``pelvis`` / ``hand_l``
+    # short names instead of ``Camp4:pelvis``. The namespaces are
+    # re-attached in a ``finally`` after ``FileSave`` so the in-scene rig
+    # is left exactly as before. Turn off only if a downstream consumer
+    # depends on the source-scene namespace being baked into the FBX.
+    strip_namespace_on_export: bool = True
 
 
 def export_take_to_fbx(
@@ -1575,13 +1583,38 @@ def export_take_to_fbx(
     if metadata is not None and skeleton:
         inject_metadata(skeleton[0], metadata)
 
+    namespace_snapshot: List[Tuple] = []
     try:
+        if getattr(config, "strip_namespace_on_export", True):
+            # Strip namespaces only from the models that will actually be
+            # written. Recollect from the live selection so ancestors and
+            # root_Offset subtree models (added above) are covered too.
+            export_models = _collect_selected_models()
+            namespace_snapshot = _strip_namespace_for_export(export_models)
+            if logger is not None:
+                logger.info(
+                    f"  export: stripped namespaces from "
+                    f"{len(namespace_snapshot)} selected model(s); "
+                    "originals restored after save."
+                )
+
         opts = _build_export_options(take_name, config)
         success = FBApplication().FileSave(out_path, opts)
         if not success:
             raise IOError(f"FileSave returned False for {out_path}")
         return out_path
     finally:
+        # Restore namespaces BEFORE clearing/restoring selection so a
+        # failure in selection restore can't leave the rig stripped.
+        if namespace_snapshot:
+            try:
+                _restore_namespace_after_export(namespace_snapshot)
+            except Exception as exc:
+                if logger is not None:
+                    logger.warn(
+                        f"  export: namespace restore failed: {exc!r} "
+                        "(rig short names may be left without namespace prefix)"
+                    )
         system.CurrentTake = prev_take
         _clear_selection()
         _restore_selection(prev_selection_snapshot)
@@ -1732,6 +1765,113 @@ def _select_subtree(root_model, added: List) -> None:
         return
     for child in children:
         _select_subtree(child, added)
+
+
+def _collect_selected_models() -> List:
+    """Return every model that is currently flagged ``Selected`` in scene."""
+    model_list = FBModelList()
+    try:
+        from pyfbsdk import FBGetSelectedModels  # type: ignore
+
+        FBGetSelectedModels(model_list, None, True, False)
+    except Exception:
+        return []
+    return [m for m in model_list]
+
+
+def _strip_namespace_for_export(models: Iterable) -> List[Tuple]:
+    """Detach every namespace prefix from each model in ``models``.
+
+    Why model-by-model
+    ------------------
+    A scene-wide ``FBSystem().Scene.NamespaceImportRename(ns, "", True)``
+    would also touch the source rig (and anything else sitting under the
+    same namespace), risking collateral damage and a renamed-back drift
+    when the restore step runs. ``ProcessObjectNamespace`` operates on a
+    single model so we never reach beyond the export selection.
+
+    Nested namespaces (``A:B:bone``) get stripped innermost-first in a
+    loop because each ``kFBRemoveAllNamespace`` call only peels one level.
+
+    Returns a snapshot list of ``(model, [ns_inner, ns_outer, ...])`` so
+    :func:`_restore_namespace_after_export` can re-attach them in the
+    correct order. The boost.python ``None`` fallback (two-arg call) is
+    tried whenever the four-arg form rejects the trailing ``None``s,
+    mirroring the same defensive pattern used by other MoBu API wrappers
+    in this module.
+    """
+    snapshot: List[Tuple] = []
+    for model in models:
+        try:
+            long_name = model.LongName or ""
+        except Exception:
+            continue
+        if ":" not in long_name:
+            continue
+        applied: List[str] = []
+        # Cap the loop just in case ``ProcessObjectNamespace`` ever
+        # returns silently without actually removing the namespace;
+        # otherwise a misbehaving SDK build could spin forever.
+        for _ in range(16):
+            try:
+                current = model.LongName or ""
+            except Exception:
+                break
+            if ":" not in current:
+                break
+            ns_chain = current.rsplit(":", 1)[0]
+            ns = ns_chain.split(":")[-1] if ":" in ns_chain else ns_chain
+            if not ns:
+                break
+            if not _process_object_namespace(
+                model, FBNamespaceAction.kFBRemoveAllNamespace, ns
+            ):
+                break
+            try:
+                after = model.LongName or ""
+            except Exception:
+                after = ""
+            if after == current:
+                break
+            applied.append(ns)
+        if applied:
+            snapshot.append((model, applied))
+    return snapshot
+
+
+def _restore_namespace_after_export(snapshot: List[Tuple]) -> None:
+    """Re-attach namespaces removed by :func:`_strip_namespace_for_export`.
+
+    Walks ``applied`` in reverse so the innermost namespace (the one
+    stripped first) is concatenated last, leaving the model with the
+    same ``A:B:bone`` ordering it had before export.
+    """
+    for model, namespaces in snapshot:
+        for ns in reversed(namespaces):
+            _process_object_namespace(
+                model, FBNamespaceAction.kFBConcatNamespace, ns
+            )
+
+
+def _process_object_namespace(model, action, namespace: str) -> bool:
+    """Call ``ProcessObjectNamespace`` resiliently across MoBu Python builds.
+
+    Some boost.python wrappers reject trailing ``None`` arguments with
+    ``ArgumentError: None.None(...)``; in that case the two-arg call
+    still works and is the documented overload for the actions we use
+    (``kFBRemoveAllNamespace`` / ``kFBConcatNamespace`` only need the
+    action and the namespace name). Returns True on success.
+    """
+    try:
+        model.ProcessObjectNamespace(action, namespace, None, None)
+        return True
+    except Exception:
+        pass
+    try:
+        model.ProcessObjectNamespace(action, namespace)
+        return True
+    except Exception:
+        return False
 
 
 def _snapshot_selection() -> List:
