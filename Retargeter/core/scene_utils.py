@@ -238,6 +238,24 @@ def collect_scene_bone_names(character: FBCharacter) -> List[str]:
     return out
 
 
+def collect_scene_bone_long_names(character: FBCharacter) -> List[str]:
+    """``LongName`` of every model linked into ``character``.
+
+    Used by the post-merge cleanup helpers to avoid ever treating one of
+    the source character's own bones as a "duplicate to transfer". The
+    candidate filter checks ``new_long_name in source_long_name_set`` and
+    skips the bone if it matches; otherwise a re-import that produces a
+    bone with the same LongName as the source rig would attempt to
+    transfer that bone's animation onto itself and then delete it.
+    """
+    out: List[str] = []
+    for m in get_target_skeleton_models(character):
+        ln = getattr(m, "LongName", "") or ""
+        if ln:
+            out.append(ln)
+    return out
+
+
 def enumerate_filled_slots(character: FBCharacter, prefixes: Sequence[str]) -> List[str]:
     """Return slot property names whose name starts with any of ``prefixes``
     AND that resolve to a non-null model.
@@ -300,3 +318,53 @@ def get_target_skeleton_models(character: FBCharacter) -> List:
         except Exception:
             continue
     return models
+
+
+def collect_scene_models_in_namespace(namespace: str) -> List:
+    """Return every FBModel whose ``LongName`` starts with ``<namespace>:``.
+
+    Wider than :func:`get_target_skeleton_models`, which only returns bones
+    bound into a HumanIK character slot (Hips, Spine, hand_l, ...). The HIK
+    slot set excludes UE rig helper bones that live alongside the slotted
+    bones in the same namespace -- ``ik_hand_root``, ``ik_foot_root``,
+    ``interaction``, ``center_of_mass``, ``root`` itself. Those helpers
+    still get duplicated when MotionBuilder increments the namespace on a
+    second merge (``UE6:ik_hand_root`` next to the existing
+    ``UE5:ik_hand_root``), and the cleanup pass needs to see them to
+    reconcile the increment back onto the original rig.
+
+    The walk is namespace-restricted (and therefore character-agnostic), so
+    callers that pass a non-empty ``namespace`` get every model that belongs
+    to that rig regardless of which character (or no character at all) owns
+    it.
+
+    Returns an empty list when ``namespace`` is empty.
+    """
+    if not namespace:
+        return []
+    needle = namespace + ":"
+    root = FBSystem().Scene.RootModel
+    if root is None:
+        return []
+    out: List = []
+    seen = set()
+    _walk_collect_models_by_namespace_prefix(root, needle, out, seen)
+    return out
+
+
+def _walk_collect_models_by_namespace_prefix(node, needle: str, out: List, seen: set) -> None:
+    try:
+        children = list(node.Children)
+    except Exception:
+        return
+    for child in children:
+        try:
+            long_name = child.LongName or ""
+        except Exception:
+            long_name = ""
+        if long_name.startswith(needle):
+            key = id(child)
+            if key not in seen:
+                seen.add(key)
+                out.append(child)
+        _walk_collect_models_by_namespace_prefix(child, needle, out, seen)

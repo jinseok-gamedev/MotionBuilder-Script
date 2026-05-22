@@ -85,6 +85,73 @@ is already wired to the Source skeleton bones. Every imported source FBX
 must have bone names matching those Source bones so the animation curves
 bind during merge.
 
+### Namespaces (required when source and target share bone names)
+
+UE4 and UE5 mannequins, UE5 Manny and Quinn, and many Maya/Max biped pairs
+share a number of bone short names (`hand_l`, `foot_l`, `pelvis`, ...). When
+both rigs sit in the same setting file with bare names, MotionBuilder cannot
+tell them apart and a single FileMerge can collapse one rig onto the other.
+The retargeter handles this by relying on namespaces:
+
+1. After characterizing both rigs in the setting file, give **each rig** its
+   own namespace via the Navigator: right-click the rig's root in the Scene
+   Browser and choose **Add Namespace** (e.g. `UE4`, `UE5`).
+2. Verify that HumanIK characters still validate after the rename
+   (the green padlock should remain).
+3. Save the setting file.
+
+You do **not** need to namespace the source FBX files you drop on the
+panel - they ship as bare `Hips`, `pelvis`, etc. The script reads the
+source character's namespace at run time and asks `FBFbxOptions.NamespaceList`
+to prefix every loaded object with it, so a bare `pelvis` arrives in the
+scene as `UE4:pelvis` and binds straight onto the source rig that was
+already there.
+
+Two safety nets back this up:
+
+- **Target rig protection** (`protect_target_transforms`, on by default)
+  snapshots every target-character bone's T/R/S immediately before each
+  merge and restores any bone the merge mutated. This catches the failure
+  mode where an incoming FBX bone short name still collides with a
+  *target* bone (the symptom looks like target bones jumping to (0,0,0)
+  with the rig visible in the Navigator but invisible in the viewport).
+- **Duplicate cleanup** (`cleanup_duplicate_bones`, on by default) catches
+  the symmetric failure mode where the FBX hierarchy differs from the
+  source character's hierarchy enough that MotionBuilder still appends
+  `" <N>"` to clashing bones; the cleanup pass transfers their animation
+  back onto the source rig and deletes the leftovers.
+
+If you ever see target bones snapping to (0,0,0) right after a merge even
+with both safety nets on, try unticking **Import base model transforms with
+animation** in **Option > Settings... > Retargeting** (this flips
+`FBFbxOptions.BaseModelsAnimation = False` for the merge so only animation
+curves arrive, never base T-pose values).
+
+#### Why you may briefly see `UE6:`, `UE7:` namespaces in the Navigator
+
+`FBFbxOptions.NamespaceList = "UE5"` does **not** mean "merge into the
+existing `UE5:` namespace"; MotionBuilder's documented behaviour is to
+*increment* the namespace if one with that name already exists, isolating
+the incoming objects into a fresh `UE6:`, then `UE7:`, and so on for each
+subsequent import. The retargeter expects this: every merge is followed by
+a cleanup pass that walks the new bones, transfers their animation curves
+onto the matching source-character bone, and deletes the temporary
+`UE6:` / `UE7:` subtree. When the cleanup finishes the Navigator only
+shows the original `UE5:*` rig again, now carrying the imported animation.
+
+The pipeline log surfaces this clearly:
+
+```
+namespace remap APPLIED: incoming objects prefixed with 'UE5:'
+namespace was incremented to 'UE6:' ('UE5' already exists in scene); cleanup will reconcile incoming bones onto the source rig.
+cleanup: transferred animation on 88 bone(s), deleted 89 model(s), skipped 0.
+cleanup: transferred from {UE6: 88} into source rig.
+```
+
+If you ever see a residual `UE6:`/`UE7:` namespace *after* a successful
+Import & Plot, that means the cleanup pass skipped or failed - inspect
+the log for `cleanup: ...skipped N` or any `cleanup: ... failed` lines.
+
 ## Running
 
 There are three ways to launch the panel from inside MotionBuilder. Pick

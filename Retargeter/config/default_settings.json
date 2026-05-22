@@ -1,6 +1,6 @@
 {
     "plot": {
-        "plot_rate": 30,
+        "plot_rate": 11,
         "plot_translation": true,
         "use_constant_key_reducer": false,
         "constant_key_reducer_keep_one": true,
@@ -12,15 +12,18 @@
         "compute": false
     },
     "import_options": {
-        "clean_existing_takes": false
+        "clean_existing_takes": false,
+        "cleanup_duplicate_bones": true,
+        "protect_target_transforms": true,
+        "import_base_models_animation": true
     },
     "match_source": {
         "enabled": true
     },
     "hik_options": {
-        "HIKForceActorSpaceId": false,
+        "HIKForceActorSpaceId": true,
         "HIKScaleCompensationId": false,
-        "HIKTopSpineCorrectionId": false,
+        "HIKTopSpineCorrectionId": true,
         "HIKFingerPropagationId": false
     },
     "root_motion": {

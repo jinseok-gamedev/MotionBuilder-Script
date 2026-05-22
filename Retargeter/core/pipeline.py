@@ -116,6 +116,24 @@ class RunConfig:
     # appeared to succeed.
     cleanup_duplicate_bones: bool = True
 
+    # Snapshot every target-character bone's Translation/Rotation/Scaling
+    # right before each FileMerge and restore any bone the merge mutated.
+    # This is a safety net for the scenario where a source FBX bone short
+    # name collides with a target-character bone short name (UE4 vs UE5
+    # mannequin share ``hand_l`` etc.) and ``BaseModelsAnimation=True``
+    # lets the merge overwrite the target bone's base transform. Turn
+    # off only if you intentionally want the merge to drive target rig
+    # base transforms (rare; the plot step normally handles that via HIK).
+    protect_target_transforms: bool = True
+
+    # Pass-through to ``FBFbxOptions.BaseModelsAnimation``. The historical
+    # behaviour (True) imports the FBX's static T-pose alongside its
+    # animation curves. If you observe target bones snapping to (0,0,0)
+    # right after a merge, flipping this to False forces the merge to
+    # import animation curves only, leaving the existing rig's base
+    # transforms untouched.
+    import_base_models_animation: bool = True
+
     # HumanIK extra options the advisor recommends. Each key is a logical
     # name handled by :func:`retarget_engine.apply_hik_options` which knows
     # how to resolve the actual property/attribute name on the live rig.
@@ -171,6 +189,8 @@ class RunConfig:
             "clean_existing_takes",
             "inject_metadata",
             "cleanup_duplicate_bones",
+            "protect_target_transforms",
+            "import_base_models_animation",
             "compute_metrics",
             "write_feedback_jsonl",
             "dry_run",
@@ -483,7 +503,11 @@ def _import_phase(
             new_takes = import_animation_only(
                 fbx_path,
                 source_character_name=config.source_character_name,
+                target_character_name=config.target_character_name,
+                protect_target_transforms=config.protect_target_transforms,
+                import_base_models_animation=config.import_base_models_animation,
                 diagnostics=diagnostics,
+                logger=logger,
             )
         except Exception as exc:
             logger.error(f"Import failed for {fbx_path}: {exc!r}")
@@ -561,6 +585,25 @@ def _log_import_diagnostics(diagnostics: Dict, logger: Logger) -> None:
     namespace_target = diagnostics.get("namespace_target") or ""
     if namespace_target:
         logger.info(f"  namespace remap target: '{namespace_target}'")
+        applied = diagnostics.get("namespace_remap_applied", False)
+        if applied:
+            logger.info(
+                f"  namespace remap APPLIED: incoming objects prefixed with "
+                f"'{namespace_target}:'"
+            )
+        else:
+            err = diagnostics.get("namespace_remap_error") or ""
+            logger.error(
+                "  namespace remap FAILED: FBFbxOptions.NamespaceList "
+                f"assignment did not take. error={err or '(no exception)'}"
+            )
+        incremented = diagnostics.get("namespace_incremented_to") or ""
+        if incremented and incremented != namespace_target:
+            logger.info(
+                f"  namespace was incremented to '{incremented}:' "
+                f"('{namespace_target}' already exists in scene); "
+                "cleanup will reconcile incoming bones onto the source rig."
+            )
     else:
         logger.info(
             "  namespace remap target: (none - source character has no namespace)"
@@ -569,8 +612,22 @@ def _log_import_diagnostics(diagnostics: Dict, logger: Logger) -> None:
     fbx_namespaces = diagnostics.get("fbx_namespaces") or []
     if fbx_namespaces:
         logger.info(f"  FBX internal namespaces: {fbx_namespaces}")
+        if namespace_target:
+            logger.warn(
+                "  FBX already carries an internal namespace; the remap will "
+                f"prefix it again, producing '{namespace_target}:{fbx_namespaces[0]}:<bone>'. "
+                "Re-export the FBX without its namespace to get a clean bind."
+            )
     else:
         logger.info("  FBX internal namespaces: (none reported)")
+
+    restored = int(diagnostics.get("target_transforms_restored") or 0)
+    if restored > 0:
+        logger.warn(
+            f"  target character transforms changed during merge: {restored} bone(s) "
+            "restored to pre-import values. This indicates an FBX bone short name "
+            "collided with a target-character bone short name."
+        )
 
     fbx_take_names = diagnostics.get("fbx_take_names") or []
     if fbx_take_names:
@@ -589,10 +646,21 @@ def _log_import_diagnostics(diagnostics: Dict, logger: Logger) -> None:
         )
 
     source_bones = list(diagnostics.get("source_bones") or [])
+    namespace_bones = list(diagnostics.get("source_namespace_bones") or [])
     logger.info(
         f"  source character bones in scene: {len(source_bones)} "
         f"(sample: {source_bones[:6]})"
     )
+    if namespace_bones:
+        extras = sorted(set(namespace_bones) - set(source_bones))
+        if extras:
+            sample_extras = extras[:6]
+            more = "" if len(extras) <= 6 else f" (+{len(extras) - 6} more)"
+            logger.info(
+                f"  source namespace also owns {len(extras)} non-HIK bone(s): "
+                f"{sample_extras}{more} (helpers like ik_hand_root, ik_foot_root, "
+                "root; cleanup will reconcile their duplicates too)"
+            )
 
     new_models = diagnostics.get("new_models") or []
     if not new_models:
@@ -601,9 +669,11 @@ def _log_import_diagnostics(diagnostics: Dict, logger: Logger) -> None:
 
     # MotionBuilder breaks name clashes by appending " <N>" (single space
     # followed by digits). Strip that so ``ball_l 1`` matches existing
-    # ``ball_l`` in source_bones.
+    # ``ball_l`` in source_bones. Use the namespace-wide set (which
+    # includes helper bones not bound to a HumanIK slot) when available so
+    # the duplicate / non-duplicate split mirrors what cleanup will see.
     suffix_re = re.compile(r"\s+\d+$")
-    source_bone_set = set(source_bones)
+    source_bone_set = set(namespace_bones) if namespace_bones else set(source_bones)
 
     duplicates: Dict[str, List[str]] = {}
     non_duplicates: List[str] = []
@@ -619,23 +689,60 @@ def _log_import_diagnostics(diagnostics: Dict, logger: Logger) -> None:
     more = "" if len(new_models) <= 6 else f" (+{len(new_models) - 6} more)"
     logger.info(f"  merge added {len(new_models)} new model(s): {sample}{more}")
 
+    prefix_counts = _summarize_namespace_prefixes(new_models)
+    if prefix_counts:
+        line = ", ".join(
+            f"{k}: {v}" for k, v in sorted(prefix_counts.items(), key=lambda kv: -kv[1])
+        )
+        logger.info(f"  new bones namespace prefix distribution: {line}")
+        no_ns = prefix_counts.get("(no namespace)", 0)
+        if namespace_target and no_ns > 0:
+            logger.warn(
+                f"  {no_ns} new bone(s) arrived without a namespace despite "
+                f"target='{namespace_target}'. The remap did not bind those "
+                "bones to the source rig."
+            )
+
     if duplicates:
         total_dup_models = sum(len(v) for v in duplicates.values())
-        logger.warn(
-            f"  {total_dup_models} new bone(s) duplicate {len(duplicates)} "
-            "existing source-rig bone name(s). Animation is keyed on the "
-            "duplicates, NOT the existing rig."
-        )
-        for original_name in list(duplicates.keys())[:10]:
-            dup_long_names = duplicates[original_name][:3]
-            logger.warn(f"    '{original_name}' duplicated as: {dup_long_names}")
-        if len(duplicates) > 10:
-            logger.warn(f"    ... (+{len(duplicates) - 10} more duplicated names)")
-        logger.warn(
-            "  Likely cause: namespace mismatch between the source character "
-            "and the FBX (or both share the same empty namespace, which forces "
-            "MoBu to suffix-rename instead of binding by LongName)."
-        )
+        incremented_ns = diagnostics.get("namespace_incremented_to") or ""
+        remap_applied = diagnostics.get("namespace_remap_applied", False)
+        if incremented_ns and remap_applied:
+            # Normal case: MoBu isolated incoming bones into a new namespace
+            # because the requested one already existed in scene. The cleanup
+            # pass below will reconcile them. Keep the log at INFO so it does
+            # not look like a problem.
+            logger.info(
+                f"  {total_dup_models} new bone(s) landed under '{incremented_ns}:' "
+                "because MoBu incremented the namespace. Animation is on those "
+                "duplicates; cleanup will transfer it onto the source rig."
+            )
+        else:
+            logger.warn(
+                f"  {total_dup_models} new bone(s) duplicate {len(duplicates)} "
+                "existing source-rig bone name(s). Animation is keyed on the "
+                "duplicates, NOT the existing rig."
+            )
+            for original_name in list(duplicates.keys())[:10]:
+                dup_long_names = duplicates[original_name][:3]
+                logger.warn(f"    '{original_name}' duplicated as: {dup_long_names}")
+            if len(duplicates) > 10:
+                logger.warn(f"    ... (+{len(duplicates) - 10} more duplicated names)")
+            if namespace_target and remap_applied:
+                logger.warn(
+                    "  Duplicates appeared even though namespace remap reported "
+                    "applied. Likely cause: FBX bone hierarchy (parent chain LongName) "
+                    "does not match the source character's hierarchy in the setting "
+                    "file. The downstream cleanup step will transfer the animation "
+                    "back onto the source rig, but you should align the rigs to "
+                    "avoid this overhead."
+                )
+            else:
+                logger.warn(
+                    "  Likely cause: namespace mismatch between the source character "
+                    "and the FBX (or both share the same empty namespace, which forces "
+                    "MoBu to suffix-rename instead of binding by LongName)."
+                )
 
     if non_duplicates:
         sample_nd = non_duplicates[:10]
@@ -646,6 +753,31 @@ def _log_import_diagnostics(diagnostics: Dict, logger: Logger) -> None:
             f"  {len(non_duplicates)} new bone(s) do NOT match any source "
             f"character bone name: {sample_nd}{more_nd}"
         )
+
+
+def _summarize_namespace_prefixes(long_names: List[str]) -> Dict[str, int]:
+    """Count new bones by their immediate namespace prefix.
+
+    LongName is ``ns1:ns2:...:short`` (colon-separated). We bucket by the
+    *innermost* namespace (the part right before the final colon) so a
+    bone like ``UE4:pelvis`` shows up under ``UE4`` and a bare ``pelvis``
+    shows up under ``(no namespace)``. The pipeline log uses this bucket
+    count to surface "remap actually took effect" at a glance: a healthy
+    run lands every new bone under the source-character namespace and
+    zero under ``(no namespace)``.
+    """
+    counts: Dict[str, int] = {}
+    for long_name in long_names:
+        if ":" in long_name:
+            prefix = long_name.rsplit(":", 1)[0]
+            # Strip any further hierarchy path so we only show the actual
+            # namespace, not the full parent chain.
+            if ":" in prefix:
+                prefix = prefix.split(":")[-1]
+        else:
+            prefix = "(no namespace)"
+        counts[prefix] = counts.get(prefix, 0) + 1
+    return counts
 
 
 def _extract_pair_features_for_run(source_char, target_char, logger: Logger):

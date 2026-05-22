@@ -35,10 +35,13 @@ from pyfbsdk import (  # type: ignore
     FBPropertyType,
     FBSystem,
     FBTake,
+    FBVector3d,
 )
 
 from .scene_utils import (
+    collect_scene_bone_long_names,
     collect_scene_bone_names,
+    collect_scene_models_in_namespace,
     find_character_by_name,
     get_character_namespace,
     get_target_skeleton_models,
@@ -95,6 +98,151 @@ def _safe_user() -> str:
 # ----------------------------------------------------------------------------
 # Import
 # ----------------------------------------------------------------------------
+
+
+def _snapshot_target_transforms(target_character) -> Dict[str, Tuple]:
+    """Snapshot every target-character bone's Translation/Rotation/Scaling.
+
+    Returns a dict keyed by the bone's ``LongName`` (stable across the
+    merge because target bones already exist in the scene) carrying
+    ``(t_xyz, r_xyz, s_xyz)`` tuples of floats. Each component slot may be
+    ``None`` if that property could not be read (we still record the bone
+    so :func:`_restore_target_transforms` can skip it gracefully).
+
+    Why ``LongName``: short names alone are ambiguous when source and
+    target characters share bone names (UE4 vs UE5 mannequin both having
+    ``hand_l``); the full ``Namespace:Hierarchy:Name`` path is the only
+    handle that uniquely points at the *target* copy.
+    """
+    out: Dict[str, Tuple] = {}
+    if target_character is None:
+        return out
+    for model in get_target_skeleton_models(target_character):
+        try:
+            long_name = model.LongName
+        except Exception:
+            continue
+        t_val = _read_vector3(model, "Translation")
+        r_val = _read_vector3(model, "Rotation")
+        s_val = _read_vector3(model, "Scaling")
+        out[long_name] = (t_val, r_val, s_val)
+    return out
+
+
+def _read_vector3(model, prop_name: str) -> Optional[Tuple[float, float, float]]:
+    """Read an FBVector3d property as a plain tuple, or ``None`` on failure."""
+    prop = getattr(model, prop_name, None)
+    if prop is None:
+        return None
+    try:
+        data = prop.Data
+    except Exception:
+        return None
+    try:
+        return (float(data[0]), float(data[1]), float(data[2]))
+    except Exception:
+        return None
+
+
+def _restore_target_transforms(
+    snapshot: Dict[str, Tuple],
+    logger=None,
+    epsilon: float = 1e-5,
+) -> Tuple[int, List[Tuple]]:
+    """Restore any target bone whose transform differs from ``snapshot``.
+
+    Returns ``(restored_count, changed_records)`` where ``changed_records``
+    is a list of ``(long_name, before_tuple, after_tuple)`` for callers
+    (e.g. pipeline diagnostics) to surface. ``before`` and ``after`` use
+    the ``(t, r, s)`` shape produced by :func:`_snapshot_target_transforms`.
+
+    ``epsilon`` controls the per-component tolerance for "no real change";
+    FBX float round-trip can introduce sub-millimeter noise that is not a
+    real mutation and should not trigger a warning or a restore.
+    """
+    if not snapshot:
+        return 0, []
+    restored = 0
+    changed: List[Tuple] = []
+    for long_name, before in snapshot.items():
+        model = _find_model_by_long_name(long_name)
+        if model is None:
+            continue
+        after_t = _read_vector3(model, "Translation")
+        after_r = _read_vector3(model, "Rotation")
+        after_s = _read_vector3(model, "Scaling")
+        after = (after_t, after_r, after_s)
+        if not _transforms_differ(before, after, epsilon):
+            continue
+        changed.append((long_name, before, after))
+        # Restore each component independently in case only one channel
+        # was clobbered. Skip ``None`` slots (couldn't read at snapshot
+        # time, nothing meaningful to restore to).
+        for prop_name, value in (
+            ("Translation", before[0]),
+            ("Rotation", before[1]),
+            ("Scaling", before[2]),
+        ):
+            if value is None:
+                continue
+            try:
+                prop = getattr(model, prop_name, None)
+                if prop is None:
+                    continue
+                prop.Data = FBVector3d(value[0], value[1], value[2])
+            except Exception as exc:
+                if logger is not None:
+                    try:
+                        logger.warn(
+                            f"  protect_target: restore {prop_name} failed on "
+                            f"'{long_name}': {exc!r}"
+                        )
+                    except Exception:
+                        pass
+        restored += 1
+    if logger is not None and changed:
+        try:
+            logger.warn(
+                f"  protect_target: {len(changed)} target bone(s) were mutated by "
+                f"the merge; restored {restored} to pre-import values. This "
+                "almost always means an incoming FBX bone collided with a "
+                "target-character bone short name."
+            )
+            for long_name, before, after in changed[:5]:
+                logger.warn(
+                    f"    '{long_name}' before T={_fmt_v(before[0])} "
+                    f"R={_fmt_v(before[1])} S={_fmt_v(before[2])}"
+                )
+                logger.warn(
+                    f"    '{long_name}' after  T={_fmt_v(after[0])} "
+                    f"R={_fmt_v(after[1])} S={_fmt_v(after[2])}"
+                )
+            if len(changed) > 5:
+                logger.warn(f"    ... (+{len(changed) - 5} more)")
+        except Exception:
+            pass
+    return restored, changed
+
+
+def _transforms_differ(before: Tuple, after: Tuple, epsilon: float) -> bool:
+    for b, a in zip(before, after):
+        if b is None or a is None:
+            if b is not a:
+                return True
+            continue
+        for bv, av in zip(b, a):
+            if abs(float(bv) - float(av)) > epsilon:
+                return True
+    return False
+
+
+def _fmt_v(v) -> str:
+    if v is None:
+        return "?"
+    try:
+        return f"({v[0]:.3f}, {v[1]:.3f}, {v[2]:.3f})"
+    except Exception:
+        return repr(v)
 
 
 def _isolate_all_character_inputs() -> List[Tuple]:
@@ -175,7 +323,11 @@ def _restore_character_inputs(snapshot: List[Tuple]) -> None:
 def import_animation_only(
     fbx_path: str,
     source_character_name: str = "",
+    target_character_name: str = "",
+    protect_target_transforms: bool = True,
+    import_base_models_animation: bool = True,
     diagnostics: Optional[Dict] = None,
+    logger=None,
 ) -> List[FBTake]:
     """Merge ``fbx_path`` bringing animation only, return new takes.
 
@@ -184,14 +336,40 @@ def import_animation_only(
     file are discarded.
 
     ``source_character_name`` is used to discover the source rig's namespace
-    so incoming bones can be remapped into it (otherwise ``Hips`` in the FBX
+    so incoming bones can be prefixed into it (otherwise ``Hips`` in the FBX
     would not bind to ``SrcRig:Hips`` in the scene and MotionBuilder would
     create a new bone tree).
+
+    ``target_character_name`` enables a sanity check: when
+    ``protect_target_transforms`` is True (default), every target bone's
+    Translation/Rotation/Scaling is snapshotted right before the merge and
+    compared right after. Any bone the merge mutated is restored to its
+    pre-import value. This is a guard against the failure mode where the
+    incoming FBX's short bone names collide with the *target* character's
+    bones (UE4 source FBX merging into a scene that also has UE5 mannequin
+    targets, e.g. shared ``hand_l`` short name) and the merge resets those
+    target bones to (0,0,0).
+
+    ``import_base_models_animation`` toggles ``FBFbxOptions.BaseModelsAnimation``;
+    see :func:`_build_import_options` for details.
 
     ``diagnostics``, when provided, is populated with merge bookkeeping:
         - ``new_models``: names of FBModels that did not exist before merge
         - ``namespace_target``: namespace the merger was asked to remap into
-        - ``source_bones``: bone short names belonging to the source character
+        - ``namespace_remap_applied``: bool, did the assignment take effect
+        - ``namespace_remap_error``: str, repr(exc) when the call failed
+        - ``source_bones``: bone short names bound to a HumanIK character slot
+        - ``source_bone_long_names``: matching ``LongName`` set
+        - ``source_namespace_bones``: short names of EVERY model under the
+          source rig's namespace, including non-HIK helper bones
+          (ik_hand_root, ik_foot_root, root, ...). The cleanup pass matches
+          incoming duplicates against this wider set so helper bones get
+          reconciled too.
+        - ``source_namespace_bone_long_names``: matching ``LongName`` set,
+          used as the "do not delete" exclusion list during cleanup.
+        - ``target_transforms_restored``: int, count of target bones rescued
+        - ``target_transforms_changed``: list of (long_name, before, after)
+          tuples for diagnostic logging
 
     Raises ``IOError`` if MotionBuilder reports that the merge failed.
     """
@@ -201,8 +379,43 @@ def import_animation_only(
     source_char = (
         find_character_by_name(source_character_name) if source_character_name else None
     )
+    target_char = (
+        find_character_by_name(target_character_name) if target_character_name else None
+    )
     target_namespace = get_character_namespace(source_char) if source_char else ""
     source_bones = collect_scene_bone_names(source_char) if source_char else []
+    source_bone_long_names = (
+        collect_scene_bone_long_names(source_char) if source_char else []
+    )
+
+    # Wider snapshot: every model currently sitting under the source rig's
+    # namespace, including helper bones that are not bound into a HumanIK
+    # slot (ik_hand_root, ik_foot_root, interaction, center_of_mass, root).
+    # Used by the post-merge cleanup so an incremented-namespace
+    # duplicate of one of those helpers (e.g. UE6:ik_hand_root) still gets
+    # transferred back onto UE5:ik_hand_root instead of being left behind.
+    source_namespace_models = (
+        collect_scene_models_in_namespace(target_namespace) if target_namespace else []
+    )
+    source_namespace_bones: List[str] = []
+    source_namespace_bone_long_names: List[str] = []
+    for _m in source_namespace_models:
+        try:
+            _short = _m.Name or ""
+        except Exception:
+            _short = ""
+        try:
+            _long = _m.LongName or ""
+        except Exception:
+            _long = ""
+        if _short:
+            source_namespace_bones.append(_short)
+        if _long:
+            source_namespace_bone_long_names.append(_long)
+
+    target_transform_snapshot: Dict[str, Tuple] = {}
+    if protect_target_transforms and target_char is not None:
+        target_transform_snapshot = _snapshot_target_transforms(target_char)
 
     pre_models = _snapshot_scene_model_names()
     snapshot = all_take_names()
@@ -230,7 +443,12 @@ def import_animation_only(
         if use_raw_merge:
             success = app.FileMerge(fbx_path, False)
         else:
-            opts = _build_import_options(fbx_path, target_namespace=target_namespace)
+            opts = _build_import_options(
+                fbx_path,
+                target_namespace=target_namespace,
+                diagnostics=diagnostics,
+                import_base_models_animation=import_base_models_animation,
+            )
             fbx_namespaces = _collect_fbx_namespaces(opts)
             if not fbx_take_names:
                 fbx_take_names = _collect_fbx_take_names(opts)
@@ -240,15 +458,40 @@ def import_animation_only(
     if not success:
         raise IOError(f"FileMerge returned False for {fbx_path}")
 
+    restored_count = 0
+    changed_records: List[Tuple] = []
+    if target_transform_snapshot:
+        restored_count, changed_records = _restore_target_transforms(
+            target_transform_snapshot, logger=logger
+        )
+
     if diagnostics is not None:
         post_models = _snapshot_scene_model_names()
         new_models = sorted(post_models - pre_models)
         diagnostics["new_models"] = new_models
         diagnostics["namespace_target"] = target_namespace
         diagnostics["source_bones"] = source_bones
+        diagnostics["source_bone_long_names"] = source_bone_long_names
+        diagnostics["source_namespace_bones"] = source_namespace_bones
+        diagnostics["source_namespace_bone_long_names"] = source_namespace_bone_long_names
         diagnostics["fbx_namespaces"] = fbx_namespaces
         diagnostics["fbx_take_names"] = fbx_take_names
         diagnostics["import_mode"] = "raw_merge" if use_raw_merge else "options_merge"
+        diagnostics["target_transforms_restored"] = restored_count
+        diagnostics["target_transforms_changed"] = changed_records
+        diagnostics.setdefault("namespace_remap_applied", False)
+        diagnostics.setdefault("namespace_remap_error", "")
+        # Use the namespace-wide bone set so the increment detector also
+        # spots cases where the only incoming duplicates are helper bones
+        # (ik_hand_root, ik_foot_root, ...) that are not bound to any HIK
+        # slot. Falls back to the slot set if the rig has no namespace.
+        _detect_bones = source_namespace_bones or source_bones
+        _detect_long_names = (
+            source_namespace_bone_long_names or source_bone_long_names
+        )
+        diagnostics["namespace_incremented_to"] = _detect_namespace_increment(
+            new_models, target_namespace, _detect_bones, _detect_long_names
+        )
 
     new_takes = takes_added_since(snapshot)
     if new_takes:
@@ -418,13 +661,26 @@ def _walk_model_long_names(node, out: set) -> None:
 def _build_import_options(
     fbx_path: str,
     target_namespace: str = "",
+    diagnostics: Optional[Dict] = None,
+    import_base_models_animation: bool = True,
 ) -> FBFbxOptions:
     """Configure FBFbxOptions for an animation-only merge.
 
-    ``target_namespace`` (if non-empty) is used to remap every namespace that
-    exists inside the FBX so its bones merge into the in-scene source rig.
-    Without this, bones like ``Hips`` in the FBX cannot bind to ``SrcRig:Hips``
-    in the scene and MotionBuilder creates a parallel skeleton.
+    ``target_namespace`` (if non-empty) is used to prefix every loaded
+    object with that namespace so its bones merge into the in-scene
+    source rig. Without this, bones like ``Hips`` in the FBX cannot bind
+    to ``SrcRig:Hips`` in the scene and MotionBuilder creates a parallel
+    skeleton.
+
+    ``import_base_models_animation`` (default True) toggles the
+    ``BaseModelsAnimation`` option on ``FBFbxOptions``. When two characters
+    in the scene share short bone names (UE4 vs UE5 mannequin), a buggy
+    merge can let the FBX's base transform overwrite the target rig's
+    bones. Setting this to False makes the merge import only animation
+    curves (no base T/R/S), which is the safer option in pure
+    "drop animation onto an existing rig" workflows. The default keeps
+    the historical behaviour because some setups rely on base transforms
+    arriving with the merge.
     """
     opts = FBFbxOptions(True, fbx_path)
 
@@ -434,7 +690,7 @@ def _build_import_options(
     # discard non-animation scene clutter where the SDK exposes a stable flag.
     _set_action(opts, "Models", FBElementAction.kFBElementActionMerge)
     _set_bool(opts, "ModelsAnimation", True)
-    _set_bool(opts, "BaseModelsAnimation", True)
+    _set_bool(opts, "BaseModelsAnimation", bool(import_base_models_animation))
     _set_bool(opts, "Animation", True)
 
     # Everything else stays out of the setting file when the option exists.
@@ -474,47 +730,77 @@ def _build_import_options(
     except Exception:
         pass
 
-    _apply_namespace_remap(opts, target_namespace)
+    _apply_namespace_remap(opts, target_namespace, diagnostics=diagnostics)
 
     return opts
 
 
-def _apply_namespace_remap(opts: FBFbxOptions, target_namespace: str) -> None:
-    """Tell MoBu to remap incoming namespaces so bones bind to the scene rig.
+def _apply_namespace_remap(
+    opts: FBFbxOptions,
+    target_namespace: str,
+    diagnostics: Optional[Dict] = None,
+) -> None:
+    """Tell MoBu to prefix every loaded object with ``target_namespace``.
 
-    The FBX may carry no namespace, a different one, or even multiple. We map
-    every namespace found in the file to ``target_namespace`` (and also map
-    ``""`` -> target so root-level bones get the same prefix) which lets
-    ``kFBElementActionMerge`` actually find existing models by LongName.
+    The correct MotionBuilder API is a single-line string assignment::
 
-    The exact API name and shape of the namespace remap on ``FBFbxOptions``
-    varies across MotionBuilder versions, so we try a handful of well-known
-    spellings and silently skip if none is supported. Callers should still
-    log via ``diagnostics`` so users can see when remap had no effect.
+        opts.NamespaceList = "UE4"
+
+    which makes ``FileMerge`` load every incoming object into the ``UE4:``
+    namespace. With the setting file's source HumanIK character already
+    sitting in ``UE4:Hips`` etc., this is exactly what ``kFBElementActionMerge``
+    needs to bind by ``LongName`` (see ``FBFbxOptions.NamespaceList`` in the
+    MotionBuilder Python SDK reference, and the ``ImportWithNamespace.py``
+    sample script).
+
+    The earlier implementation of this function tried pair-list assignments
+    (``[(old_ns, new_ns), ...]``) and called methods (``SetNamespace``,
+    ``AddNamespaceMatch``, ``AddNamespaceTransfer``) that do not exist on
+    ``FBFbxOptions``. Both silently failed inside ``try/except``, so every
+    FBX merged without a namespace prefix and produced the two symptoms
+    that motivated this rewrite: a duplicated bone tree (LongName mismatch)
+    and target bones reset to (0,0,0) when their short names collided with
+    the FBX's bone short names.
+
+    ``diagnostics`` (optional): populated with::
+
+        {
+            "namespace_remap_applied": bool,   # True iff assignment took
+            "namespace_remap_error":   str,    # repr(exc) on failure
+        }
+
+    so the caller can surface success/failure in the per-import log.
     """
+    if diagnostics is not None:
+        diagnostics.setdefault("namespace_remap_applied", False)
+        diagnostics.setdefault("namespace_remap_error", "")
+
     if not target_namespace:
         return
 
-    namespaces = _collect_fbx_namespaces(opts)
-    pairs = []
-    seen = set()
-    for ns in list(namespaces) + [""]:
-        key = (ns, target_namespace)
-        if key in seen or ns == target_namespace:
-            continue
-        seen.add(key)
-        pairs.append(key)
-
-    if not pairs:
+    try:
+        opts.NamespaceList = target_namespace
+    except Exception as exc:
+        if diagnostics is not None:
+            diagnostics["namespace_remap_applied"] = False
+            diagnostics["namespace_remap_error"] = repr(exc)
         return
 
-    if _try_namespace_list(opts, pairs):
-        return
-    _try_namespace_method(opts, pairs)
+    if diagnostics is not None:
+        diagnostics["namespace_remap_applied"] = True
+        diagnostics["namespace_remap_error"] = ""
 
 
 def _collect_fbx_namespaces(opts: FBFbxOptions) -> List[str]:
-    """Best-effort listing of namespaces present inside the FBX about to merge."""
+    """Best-effort listing of namespaces present inside the FBX about to merge.
+
+    Kept for diagnostics only. If the FBX itself was authored with an
+    internal namespace (e.g. ``OldNS:Hips``) and we then assign
+    ``NamespaceList = "UE4"``, MotionBuilder *prefixes* (does not replace)
+    so the bone arrives as ``UE4:OldNS:Hips`` and still fails to bind. The
+    caller should log a WARN when this situation is detected so the
+    operator can re-export the FBX without the internal namespace.
+    """
     out: List[str] = []
     getter = getattr(opts, "GetNamespaceCount", None)
     name_getter = getattr(opts, "GetNamespaceName", None) or getattr(
@@ -530,43 +816,6 @@ def _collect_fbx_namespaces(opts: FBFbxOptions) -> List[str]:
         except Exception:
             pass
     return out
-
-
-def _try_namespace_list(opts: FBFbxOptions, pairs: List) -> bool:
-    """Try the ``opts.NamespaceList`` property style (newer MoBu)."""
-    if not hasattr(opts, "NamespaceList"):
-        return False
-    try:
-        opts.NamespaceList = [list(p) for p in pairs]
-        return True
-    except Exception:
-        try:
-            opts.NamespaceList = pairs
-            return True
-        except Exception:
-            return False
-
-
-def _try_namespace_method(opts: FBFbxOptions, pairs: List) -> bool:
-    """Try call-style namespace remap helpers."""
-    for method_name in (
-        "SetNamespace",
-        "AddNamespaceMatch",
-        "AddNamespaceTransfer",
-    ):
-        fn = getattr(opts, method_name, None)
-        if not callable(fn):
-            continue
-        ok_any = False
-        for old, new in pairs:
-            try:
-                fn(old, new)
-                ok_any = True
-            except Exception:
-                continue
-        if ok_any:
-            return True
-    return False
 
 
 def _set_action(opts: FBFbxOptions, name: str, action) -> None:
@@ -612,6 +861,107 @@ def _set_bool(opts: FBFbxOptions, name: str, value: bool) -> None:
 _DUP_SUFFIX_RE = re.compile(r"^(.+?)(\s+\d+)$")
 
 
+def _candidate_original_short(
+    short_name: str,
+    source_bone_set: set,
+) -> Optional[str]:
+    """Decide whether ``short_name`` should be cleaned up onto a source bone.
+
+    Two acceptance rules, in order:
+
+    1. ``" <N>"`` suffix stripping. MotionBuilder appends ``" 1"``, ``" 2"`` to
+       break LongName clashes when an FBX bone's LongName matches an existing
+       scene model but the parent chain differs. ``"ball_l 1"`` -> ``"ball_l"``.
+    2. Direct match. The new bone's short name is literally one of the source
+       character's bone short names. Happens when ``FBFbxOptions.NamespaceList``
+       isolates the incoming bones into a freshly-incremented namespace (e.g.
+       ``UE6:pelvis`` while the source rig owns ``UE5:pelvis``); the bone is
+       *not* suffix-renamed because the LongName clash was resolved by the new
+       namespace, but the short name still matches.
+
+    Returns the source bone's short name to transfer onto, or ``None`` if
+    neither rule matched.
+    """
+    m = _DUP_SUFFIX_RE.match(short_name)
+    if m and m.group(1) in source_bone_set:
+        return m.group(1)
+    if short_name in source_bone_set:
+        return short_name
+    return None
+
+
+def _detect_namespace_increment(
+    new_models: List[str],
+    target_namespace: str,
+    source_bones: List[str],
+    source_bone_long_names: List[str],
+) -> str:
+    """Detect when MotionBuilder isolated incoming bones into a NEW namespace.
+
+    ``FBFbxOptions.NamespaceList = "UE5"`` does NOT merge incoming objects
+    into the existing ``UE5:`` namespace if one already exists in the
+    scene; MotionBuilder instead increments to ``UE6:``, ``UE7:``, ... to
+    keep the new objects isolated. This function spots that case by:
+
+    * Looking at every newly-created model (post-merge ``new_models``).
+    * Skipping source-character bones (would have arrived via re-emit, not
+      a real increment).
+    * Bucketing by innermost namespace prefix.
+    * Counting only buckets whose member bones' short names match a
+      source-character bone (so we're confident this prefix carries the
+      incoming source FBX, not unrelated helper objects).
+    * Returning whichever non-``target_namespace`` prefix has the highest
+      hit count, or ``""`` if the merge bound cleanly into
+      ``target_namespace`` (which is the happy path when the source
+      namespace did not yet exist in scene).
+
+    Returned value is consumed by :func:`_log_import_diagnostics` to emit
+    a "namespace was incremented to 'UE6'; cleanup will reconcile" INFO
+    line, and by the cleanup helpers to recognise the increment case as
+    expected behaviour rather than a hard failure.
+    """
+    if not target_namespace or not new_models:
+        return ""
+    source_bone_set = set(source_bones)
+    source_long_set = set(source_bone_long_names)
+    counts: Dict[str, int] = {}
+    for long_name in new_models:
+        if long_name in source_long_set:
+            continue
+        if ":" not in long_name:
+            continue
+        prefix_full = long_name.rsplit(":", 1)[0]
+        prefix = prefix_full.split(":")[-1] if ":" in prefix_full else prefix_full
+        if prefix == target_namespace:
+            continue
+        short = long_name.rsplit(":", 1)[-1]
+        if short in source_bone_set:
+            counts[prefix] = counts.get(prefix, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _summarize_long_name_namespaces(long_names: List[str]) -> Dict[str, int]:
+    """Bucket ``long_names`` by their innermost namespace prefix.
+
+    Mirrors the pipeline-side ``_summarize_namespace_prefixes`` so the cleanup
+    log can say "transferred from {UE6: 88, UE7: 88} into source rig" in the
+    same format the import diagnostics already use. A bone with no colon
+    falls under ``(no namespace)``.
+    """
+    counts: Dict[str, int] = {}
+    for long_name in long_names:
+        if ":" in long_name:
+            prefix = long_name.rsplit(":", 1)[0]
+            if ":" in prefix:
+                prefix = prefix.split(":")[-1]
+        else:
+            prefix = "(no namespace)"
+        counts[prefix] = counts.get(prefix, 0) + 1
+    return counts
+
+
 def cleanup_duplicate_bones(
     diagnostics: Dict,
     source_character_name: str = "",
@@ -620,8 +970,19 @@ def cleanup_duplicate_bones(
 ) -> Dict[str, int]:
     """Transfer animation off ``" <N>"``-renamed duplicates back to source bones.
 
-    ``diagnostics`` must be the dict populated by :func:`import_animation_only`
-    (it carries ``new_models`` and ``source_bones``).
+    ``diagnostics`` must be the dict populated by :func:`import_animation_only`.
+    Two source bone sets are consulted, in priority order:
+
+    1. ``source_namespace_bones`` (preferred): every model under the source
+       rig's namespace, including non-HIK helper bones. This is what lets us
+       reconcile incremented-namespace duplicates of ``ik_hand_root`` /
+       ``ik_foot_root`` / ``interaction`` / ``center_of_mass`` / ``root``
+       back onto the original ``UE5:`` rig. Without this set the cleanup
+       would silently leave those helper bones behind because the HumanIK
+       character does not bind them to slots.
+    2. ``source_bones`` (fallback): the narrower "bones bound to a HumanIK
+       slot" list, used only when the source rig has no namespace and the
+       namespace walk therefore returns nothing.
 
     ``take_names`` limits which takes are processed; defaults to every take
     currently in the scene. In typical use the caller passes only the takes
@@ -633,36 +994,62 @@ def cleanup_duplicate_bones(
     result = {"transferred": 0, "deleted": 0, "skipped": 0}
 
     new_models = list(diagnostics.get("new_models") or [])
-    source_bones = list(diagnostics.get("source_bones") or [])
-    if not new_models or not source_bones:
-        return result
+    namespace_bones = list(diagnostics.get("source_namespace_bones") or [])
+    namespace_long_names = list(
+        diagnostics.get("source_namespace_bone_long_names") or []
+    )
+    slot_bones = list(diagnostics.get("source_bones") or [])
+    slot_long_names = list(diagnostics.get("source_bone_long_names") or [])
 
-    source_bone_set = set(source_bones)
+    # Prefer the namespace-wide set so helper bones (ik_hand_root etc.)
+    # are matched; fall back to the HIK-slot set when the source rig
+    # has no namespace at all (namespace walk returns empty).
+    if namespace_bones:
+        source_bone_set = set(namespace_bones)
+        source_long_name_set = set(namespace_long_names)
+    else:
+        source_bone_set = set(slot_bones)
+        source_long_name_set = set(slot_long_names)
+
+    if not new_models or not source_bone_set:
+        return result
 
     candidate_pairs: List[Tuple[str, str]] = []
     for long_name in new_models:
-        short = long_name.rsplit(":", 1)[-1]
-        match = _DUP_SUFFIX_RE.match(short)
-        if not match:
+        # Never treat the source rig's own bones as duplicates;
+        # transferring a bone's animation onto itself and then deleting
+        # the bone would destroy the source rig.
+        if long_name in source_long_name_set:
             continue
-        original_short = match.group(1)
-        if original_short in source_bone_set:
-            candidate_pairs.append((long_name, original_short))
+        short = long_name.rsplit(":", 1)[-1]
+        original_short = _candidate_original_short(short, source_bone_set)
+        if original_short is None:
+            continue
+        candidate_pairs.append((long_name, original_short))
 
     if not candidate_pairs:
         if logger is not None:
             logger.info("  cleanup: no duplicates to clean.")
         return result
 
+    # Build the source-side transfer target map. Use the namespace-wide
+    # model walk when we have a namespace, so helper bones are reachable;
+    # otherwise fall back to the HIK character slot models.
     source_char = (
         find_character_by_name(source_character_name) if source_character_name else None
     )
+    target_namespace = diagnostics.get("namespace_target") or ""
+    src_models: List = []
+    if target_namespace:
+        src_models = collect_scene_models_in_namespace(target_namespace)
+    if not src_models and source_char is not None:
+        src_models = get_target_skeleton_models(source_char)
+
     src_bone_map: Dict[str, object] = {}
-    if source_char is not None:
-        for m in get_target_skeleton_models(source_char):
-            name = getattr(m, "Name", "") or ""
-            if name and name not in src_bone_map:
-                src_bone_map[name] = m
+    for m in src_models:
+        name = getattr(m, "Name", "") or ""
+        if name and name not in src_bone_map:
+            src_bone_map[name] = m
 
     system = FBSystem()
     if take_names is None:
@@ -740,6 +1127,16 @@ def cleanup_duplicate_bones(
             f"{result['transferred']} bone(s), deleted {result['deleted']} "
             f"model(s), skipped {result['skipped']}."
         )
+        if result["transferred"] > 0 or result["deleted"] > 0:
+            transferred_long_names = [pair[0] for pair in candidate_pairs]
+            ns_counts = _summarize_long_name_namespaces(transferred_long_names)
+            ns_line = ", ".join(
+                f"{k}: {v}"
+                for k, v in sorted(ns_counts.items(), key=lambda kv: -kv[1])
+            )
+            logger.info(
+                f"  cleanup: transferred from {{{ns_line}}} into source rig."
+            )
     return result
 
 
@@ -752,18 +1149,41 @@ def delete_duplicate_bone_models(
     Some FBX files merge a skeleton into the scene but do not add a take. In
     that case there is no imported take to transfer animation from, but leaving
     the duplicate skeleton in the scene can destabilize the next HIK plot.
+
+    Mirrors :func:`cleanup_duplicate_bones` matching: prefer the
+    namespace-wide bone set so non-HIK helper bones (``ik_hand_root``,
+    ``ik_foot_root``, ``interaction``, ``center_of_mass``, ``root``) are
+    still considered duplicates of their incremented-namespace twins. Fall
+    back to the HIK slot set when the source rig has no namespace.
     """
     result = {"deleted": 0, "skipped": 0}
     new_models = list(diagnostics.get("new_models") or [])
-    source_bones = set(diagnostics.get("source_bones") or [])
-    if not new_models or not source_bones:
+    namespace_bones = list(diagnostics.get("source_namespace_bones") or [])
+    namespace_long_names = list(
+        diagnostics.get("source_namespace_bone_long_names") or []
+    )
+    slot_bones = list(diagnostics.get("source_bones") or [])
+    slot_long_names = list(diagnostics.get("source_bone_long_names") or [])
+
+    if namespace_bones:
+        source_bone_set = set(namespace_bones)
+        source_long_name_set = set(namespace_long_names)
+    else:
+        source_bone_set = set(slot_bones)
+        source_long_name_set = set(slot_long_names)
+
+    if not new_models or not source_bone_set:
         return result
 
     duplicates_to_delete: List[object] = []
     for long_name in new_models:
+        # Never delete a source-rig bone (LongName-exact match means the
+        # new_models snapshot picked up a re-emitted source rig bone
+        # rather than a true duplicate).
+        if long_name in source_long_name_set:
+            continue
         short = long_name.rsplit(":", 1)[-1]
-        match = _DUP_SUFFIX_RE.match(short)
-        if not match or match.group(1) not in source_bones:
+        if _candidate_original_short(short, source_bone_set) is None:
             continue
         dup_model = _find_model_by_long_name(long_name)
         if dup_model is None:

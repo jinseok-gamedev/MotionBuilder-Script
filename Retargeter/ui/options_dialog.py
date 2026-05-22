@@ -307,6 +307,30 @@ class OptionsDialog(QtWidgets.QDialog):
         self.chk_clean_takes = QtWidgets.QCheckBox("Remove existing takes before import")
         v.addWidget(self.chk_clean_takes)
 
+        self.chk_protect_target = QtWidgets.QCheckBox(
+            "Protect target rig transforms during merge"
+        )
+        self.chk_protect_target.setToolTip(
+            "Snapshot every target-character bone's T/R/S right before each FileMerge "
+            "and restore any bone the merge mutated. Catches the failure mode where "
+            "an incoming source FBX bone short name collides with a target-character "
+            "bone short name (UE4 vs UE5 mannequin share 'hand_l' etc.) and the merge "
+            "resets those target bones to (0,0,0)."
+        )
+        v.addWidget(self.chk_protect_target)
+
+        self.chk_import_base_anim = QtWidgets.QCheckBox(
+            "Import base model transforms with animation"
+        )
+        self.chk_import_base_anim.setToolTip(
+            "Pass-through to FBFbxOptions.BaseModelsAnimation. The default (on) imports "
+            "the FBX's static T-pose alongside its animation curves. Turn off if target "
+            "bones snap to (0,0,0) right after a merge despite the protect option above "
+            "- this forces animation-curve-only import and leaves the existing rig's "
+            "base transforms strictly untouched."
+        )
+        v.addWidget(self.chk_import_base_anim)
+
         self.chk_cleanup_dups = QtWidgets.QCheckBox("Cleanup duplicate bones after merge")
         self.chk_cleanup_dups.setToolTip(
             "When FBX hierarchy differs from the source rig, FileMerge appends ' <N>' "
@@ -676,6 +700,8 @@ class OptionsDialog(QtWidgets.QDialog):
             "import_options": {
                 "clean_existing_takes": self.chk_clean_takes.isChecked(),
                 "cleanup_duplicate_bones": self.chk_cleanup_dups.isChecked(),
+                "protect_target_transforms": self.chk_protect_target.isChecked(),
+                "import_base_models_animation": self.chk_import_base_anim.isChecked(),
             },
             "match_source": {
                 "enabled": self.chk_match_source.isChecked(),
@@ -726,6 +752,8 @@ class OptionsDialog(QtWidgets.QDialog):
         import_cfg = settings.get("import_options") or {}
         self.chk_clean_takes.setChecked(bool(import_cfg.get("clean_existing_takes", False)))
         self.chk_cleanup_dups.setChecked(bool(import_cfg.get("cleanup_duplicate_bones", True)))
+        self.chk_protect_target.setChecked(bool(import_cfg.get("protect_target_transforms", True)))
+        self.chk_import_base_anim.setChecked(bool(import_cfg.get("import_base_models_animation", True)))
 
         match = settings.get("match_source") or {}
         self.chk_match_source.setChecked(bool(match.get("enabled", True)))

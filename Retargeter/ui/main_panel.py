@@ -821,6 +821,8 @@ class RetargeterPanel(QtWidgets.QWidget):
             match_source=opt.chk_match_source.isChecked(),
             clean_existing_takes=opt.chk_clean_takes.isChecked(),
             cleanup_duplicate_bones=opt.chk_cleanup_dups.isChecked(),
+            protect_target_transforms=opt.chk_protect_target.isChecked(),
+            import_base_models_animation=opt.chk_import_base_anim.isChecked(),
             inject_metadata=opt.chk_inject_metadata.isChecked(),
             hik_options=hik_options,
             compute_metrics=opt.chk_compute_metrics.isChecked(),
