@@ -9,7 +9,7 @@ operator gets a clear error before any heavy import / plot work starts.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from pyfbsdk import (  # type: ignore
     FBCharacter,
@@ -23,6 +23,48 @@ LEFT_HAND_SLOT = "LeftHandLink"
 RIGHT_HAND_SLOT = "RightHandLink"
 LEFT_FOOT_SLOT = "LeftFootLink"
 RIGHT_FOOT_SLOT = "RightFootLink"
+
+# Extended slot constants used by skeleton_features for shape extraction.
+# These follow the same ``<BoneName>Link`` convention exposed on FBCharacter's
+# PropertyList (e.g. ``character.PropertyList.Find("LeftArmLink")[0]``).
+LEFT_SHOULDER_SLOT = "LeftShoulderLink"   # clavicle
+LEFT_ARM_SLOT = "LeftArmLink"             # upper arm
+LEFT_FORE_ARM_SLOT = "LeftForeArmLink"    # elbow
+RIGHT_SHOULDER_SLOT = "RightShoulderLink"
+RIGHT_ARM_SLOT = "RightArmLink"
+RIGHT_FORE_ARM_SLOT = "RightForeArmLink"
+
+LEFT_UP_LEG_SLOT = "LeftUpLegLink"
+LEFT_LEG_SLOT = "LeftLegLink"             # knee
+LEFT_TOE_BASE_SLOT = "LeftToeBaseLink"
+RIGHT_UP_LEG_SLOT = "RightUpLegLink"
+RIGHT_LEG_SLOT = "RightLegLink"
+RIGHT_TOE_BASE_SLOT = "RightToeBaseLink"
+
+NECK_SLOT = "NeckLink"
+
+# Prefix groups for "how many of these slots are populated?" queries.
+# HumanIK exposes Spine, Spine1..Spine9 (any subset filled depending on rig)
+# and Neck, Neck1..Neck9. The fingers expose <Side>Hand<Finger><Index>Link
+# where Index is 1..3 (most rigs) or A..D (older). enumerate_filled_slots
+# below matches on the leading prefix and returns whichever ones the rig
+# actually exposes, so we do not need to enumerate the full set ahead of time.
+SPINE_PREFIXES = ("Spine",)
+NECK_PREFIXES = ("Neck",)
+LEFT_FINGER_PREFIXES = (
+    "LeftHandThumb",
+    "LeftHandIndex",
+    "LeftHandMiddle",
+    "LeftHandRing",
+    "LeftHandPinky",
+)
+RIGHT_FINGER_PREFIXES = (
+    "RightHandThumb",
+    "RightHandIndex",
+    "RightHandMiddle",
+    "RightHandRing",
+    "RightHandPinky",
+)
 
 # Slots considered required for a usable HumanIK character. The full HIK
 # definition has 50+ slots but if these are missing the rig is unusable for
@@ -193,6 +235,43 @@ def collect_scene_bone_names(character: FBCharacter) -> List[str]:
         n = getattr(m, "Name", "") or ""
         if n:
             out.append(n)
+    return out
+
+
+def enumerate_filled_slots(character: FBCharacter, prefixes: Sequence[str]) -> List[str]:
+    """Return slot property names whose name starts with any of ``prefixes``
+    AND that resolve to a non-null model.
+
+    Used by skeleton_features to ask "how many Spine* slots are bound?" or
+    "how many LeftHand<finger>* slots are bound?" without having to enumerate
+    the entire HumanIK slot set up front (the exact set varies between rig
+    builds: some rigs only fill Spine1..Spine3, others go up to Spine9; some
+    rigs only have 2 thumb joints, etc).
+
+    Slot names always end in ``"Link"`` on FBCharacter's PropertyList; we
+    enforce that to avoid accidentally matching unrelated user properties
+    that happen to share a prefix.
+    """
+    if character is None or not prefixes:
+        return []
+    out: List[str] = []
+    for prop in character.PropertyList:
+        try:
+            name = prop.GetName()
+        except Exception:
+            continue
+        if not name.endswith("Link"):
+            continue
+        if not any(name.startswith(pfx) for pfx in prefixes):
+            continue
+        try:
+            if len(prop) == 0:
+                continue
+            if prop[0] is None:
+                continue
+        except Exception:
+            continue
+        out.append(name)
     return out
 
 

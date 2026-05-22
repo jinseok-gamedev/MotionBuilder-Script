@@ -5,13 +5,23 @@
         "use_constant_key_reducer": false,
         "constant_key_reducer_keep_one": true,
         "precise_time_discontinuities": true,
+        "plot_all_takes": false,
         "rotation_filter": "gimble_killer"
+    },
+    "metrics": {
+        "compute": false
     },
     "import_options": {
         "clean_existing_takes": false
     },
     "match_source": {
         "enabled": true
+    },
+    "hik_options": {
+        "HIKForceActorSpaceId": false,
+        "HIKScaleCompensationId": false,
+        "HIKTopSpineCorrectionId": false,
+        "HIKFingerPropagationId": false
     },
     "root_motion": {
         "default_mode": "keep"

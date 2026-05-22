@@ -37,10 +37,17 @@ _COL_EXPORT = 0
 _COL_NAME = 1
 _COL_SOURCE = 2
 _COL_ROOT_MOTION = 3
-_COL_STATUS = 4
+_COL_QUALITY = 4
+_COL_STATUS = 5
 
-_HEADERS = ("Export", "Take", "Source", "Root Motion", "Status")
+_HEADERS = ("Export", "Take", "Source", "Root Motion", "Quality", "Status")
 _ROOT_MOTION_CHOICES = (MODE_KEEP, MODE_STRIP, MODE_EXTRACT)
+
+# Quality combo entries. The empty string is the "unset" value and is what
+# collect_quality_labels uses to skip a take when writing the feedback log.
+_QUALITY_CHOICES = ("-", "good", "bad")
+_QUALITY_UNSET = "-"
+
 _PATH_ROLE = QtCore.Qt.UserRole + 1
 
 _FILTER_ALL = "All"
@@ -109,6 +116,7 @@ class TakeTable(QtWidgets.QWidget):
         header.setSectionResizeMode(_COL_NAME, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(_COL_SOURCE, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(_COL_ROOT_MOTION, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(_COL_QUALITY, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(_COL_STATUS, QtWidgets.QHeaderView.ResizeToContents)
         self.table.setMinimumHeight(160)
         outer.addWidget(self.table, stretch=1)
@@ -197,6 +205,15 @@ class TakeTable(QtWidgets.QWidget):
             combo.setCurrentText(default_root_motion)
         self.table.setCellWidget(row, _COL_ROOT_MOTION, combo)
 
+        quality_combo = QtWidgets.QComboBox()
+        quality_combo.addItems(_QUALITY_CHOICES)
+        quality_combo.setCurrentText(_QUALITY_UNSET)
+        quality_combo.setToolTip(
+            "Operator's quality label (good / bad / unset). Save with the "
+            "'Save feedback' action on the panel to append to _retarget_feedback.jsonl."
+        )
+        self.table.setCellWidget(row, _COL_QUALITY, quality_combo)
+
         status_item = QtWidgets.QTableWidgetItem("pending")
         status_item.setForeground(QtCore.Qt.gray)
         self.table.setItem(row, _COL_STATUS, status_item)
@@ -257,6 +274,57 @@ class TakeTable(QtWidgets.QWidget):
             combo = self.table.cellWidget(row, _COL_ROOT_MOTION)
             if combo is not None:
                 combo.setCurrentText(mode)
+
+    def set_quality_hint(self, take_name: str, label: Optional[str]) -> None:
+        """Pre-fill the Quality combo with a metric-derived suggestion.
+
+        Only writes when the operator has not yet picked anything (still
+        at ``"-"``); we never overwrite an explicit choice. Suggested rows
+        get a faint yellow tint on the Quality cell so it is visually
+        distinct from manually-set labels, and the combo carries a tooltip
+        explaining the source of the hint."""
+        if not label or label not in _QUALITY_CHOICES:
+            return
+        for row in range(self.table.rowCount()):
+            name_item = self.table.item(row, _COL_NAME)
+            if name_item is None:
+                continue
+            stored = name_item.data(QtCore.Qt.UserRole) or name_item.text()
+            if stored != take_name:
+                continue
+            combo = self.table.cellWidget(row, _COL_QUALITY)
+            if combo is None:
+                return
+            if combo.currentText() != _QUALITY_UNSET:
+                return
+            combo.blockSignals(True)
+            combo.setCurrentText(label)
+            combo.blockSignals(False)
+            combo.setStyleSheet("QComboBox { background-color: #fff59d; }")
+            combo.setToolTip(
+                f"Suggested by quality metrics ({label}). Confirm or change "
+                "before clicking 'Save feedback'."
+            )
+            return
+
+    def collect_quality_labels(self) -> "list[tuple[str, str]]":
+        """Return ``[(take_name, label), ...]`` for every labelled take.
+
+        Skips rows where Quality is still ``"-"`` (unset) so the feedback
+        log only grows on explicit operator opinions, never on noise.
+        """
+        out = []
+        for row in range(self.table.rowCount()):
+            name_item = self.table.item(row, _COL_NAME)
+            quality_combo = self.table.cellWidget(row, _COL_QUALITY)
+            if name_item is None or quality_combo is None:
+                continue
+            take_name = name_item.data(QtCore.Qt.UserRole) or name_item.text()
+            label = quality_combo.currentText()
+            if not label or label == _QUALITY_UNSET:
+                continue
+            out.append((take_name, label))
+        return out
 
     # ------------------------------------------------------------------
     # Status updates

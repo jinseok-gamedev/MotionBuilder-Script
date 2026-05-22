@@ -37,9 +37,10 @@ import importlib
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, List, Optional
 
+from . import feedback_log
 from .fbx_io import (
     ExportConfig,
     ExportMetadata,
@@ -51,6 +52,7 @@ from .fbx_io import (
 from .logger import Logger, make_run_log_path
 from .retarget_engine import (
     PlotConfig,
+    apply_hik_options,
     apply_match_source,
     link_input,
     plot_to_skeleton,
@@ -114,6 +116,28 @@ class RunConfig:
     # appeared to succeed.
     cleanup_duplicate_bones: bool = True
 
+    # HumanIK extra options the advisor recommends. Each key is a logical
+    # name handled by :func:`retarget_engine.apply_hik_options` which knows
+    # how to resolve the actual property/attribute name on the live rig.
+    # Empty dict means "do not touch any HIK option" (legacy behaviour).
+    hik_options: Dict[str, bool] = field(default_factory=dict)
+
+    # Opt-in post-plot per-take quality metrics. They are several times more
+    # expensive than the plot itself on long takes, so they stay off by
+    # default and only turn on when the operator ticks the option in the UI.
+    compute_metrics: bool = False
+    # If True, every plotted take's features/options/(metrics) are appended
+    # to ``{out_dir}/_retarget_feedback.jsonl`` for later model training.
+    write_feedback_jsonl: bool = True
+
+    # Names of the option fields that the Auto recommend advisor most
+    # recently *changed* relative to the operator's prior values. Purely
+    # informational: the dialog fills this in when the user pressed Auto,
+    # the pipeline echoes it back into the feedback log so stats_summary
+    # can show which knobs the advisor is moving most often.
+    advisor_changed_fields: List[str] = field(default_factory=list)
+    advisor_version: str = "rules-v1"
+
     dry_run: bool = False
     write_log_file: bool = True
     engine_preset: str = "ue5"
@@ -147,14 +171,21 @@ class RunConfig:
             "clean_existing_takes",
             "inject_metadata",
             "cleanup_duplicate_bones",
+            "compute_metrics",
+            "write_feedback_jsonl",
             "dry_run",
             "write_log_file",
             "engine_preset",
+            "advisor_version",
         ):
             if attr in data:
                 setattr(cfg, attr, data[attr])
         if "fbx_files" in data:
             cfg.fbx_files = list(data["fbx_files"])
+        if isinstance(data.get("hik_options"), dict):
+            cfg.hik_options = {str(k): bool(v) for k, v in data["hik_options"].items()}
+        if isinstance(data.get("advisor_changed_fields"), (list, tuple)):
+            cfg.advisor_changed_fields = [str(x) for x in data["advisor_changed_fields"]]
         return cfg
 
 
@@ -172,6 +203,11 @@ class TakeResult:
     status: str = "pending"  # pending | ok | skipped | failed
     error: str = ""
     notes: List[str] = field(default_factory=list)
+    # Weak label hint produced by quality_metrics.suggest_label() when
+    # RunConfig.compute_metrics is on. ``None`` if metrics were not
+    # computed or the metric signals were ambiguous; the UI uses this to
+    # pre-fill the Quality column with a softly-highlighted suggestion.
+    label_hint: Optional[str] = None
 
     def to_csv_row(self) -> Dict[str, str]:
         return {
@@ -182,6 +218,7 @@ class TakeResult:
             "status": self.status,
             "error": self.error,
             "notes": " | ".join(self.notes),
+            "label_hint": self.label_hint or "",
         }
 
 
@@ -410,7 +447,18 @@ def _run_inner(
         logger.warn("No takes were created; nothing to plot.")
         return report
 
-    _plot_phase(config, source_char, target_char, created_takes, logger, hooks, report, cancel_check)
+    run_id = feedback_log.new_run_id()
+    _plot_phase(
+        config,
+        source_char,
+        target_char,
+        created_takes,
+        logger,
+        hooks,
+        report,
+        cancel_check,
+        run_id=run_id,
+    )
     _export_phase(config, target_char, created_takes, logger, hooks, report, progress_cb, cancel_check)
 
     return report
@@ -600,6 +648,91 @@ def _log_import_diagnostics(diagnostics: Dict, logger: Logger) -> None:
         )
 
 
+def _extract_pair_features_for_run(source_char, target_char, logger: Logger):
+    """Lazy-import + best-effort PairFeatures extraction for the JSONL log.
+
+    Imported lazily so the pipeline keeps working even if a future MoBu
+    upgrade breaks ``skeleton_features`` (one optional dataset row is much
+    less important than the plot itself).
+    """
+    try:
+        from .skeleton_features import extract_pair_features
+
+        return extract_pair_features(source_char, target_char)
+    except Exception as exc:
+        logger.warn(f"skeleton_features.extract_pair_features failed: {exc!r}")
+        return None
+
+
+def _record_take_feedback(
+    *,
+    config: RunConfig,
+    logger: Logger,
+    report: RunReport,
+    run_id: str,
+    take_name: str,
+    source_char,
+    target_char,
+    pair_features_dict: Dict,
+    source_height_m: Optional[float],
+    hik_applied: Dict[str, bool],
+    plot_ok: bool,
+    plot_error: str,
+) -> None:
+    """Write one TakeFeedback line per take. Never raises."""
+    if not config.write_feedback_jsonl or not config.out_dir:
+        return
+    metrics_dict = None
+    label_hint: Optional[str] = None
+    if plot_ok and config.compute_metrics:
+        try:
+            from .quality_metrics import compute_metrics, suggest_label
+
+            metrics = compute_metrics(
+                source_char, target_char, source_height_m=source_height_m
+            )
+            metrics_dict = metrics.to_dict()
+            try:
+                label_hint = suggest_label(metrics)
+            except Exception as exc:
+                # suggest_label is intentionally cheap; if it explodes we
+                # still want the metric numbers in the log.
+                logger.warn(f"suggest_label failed for '{take_name}': {exc!r}")
+        except Exception as exc:
+            logger.warn(f"compute_metrics failed for '{take_name}': {exc!r}")
+
+    tr = _find_result(report, take_name)
+    source_file = tr.source_file if tr is not None else ""
+    if tr is not None and label_hint:
+        tr.label_hint = label_hint
+
+    try:
+        record = feedback_log.TakeFeedback(
+            take=take_name,
+            source_file=source_file,
+            source_char=getattr(source_char, "LongName", "") or "",
+            target_char=getattr(target_char, "LongName", "") or "",
+            features=pair_features_dict or {},
+            options_used={
+                "plot": asdict(config.plot),
+                "match_source": bool(config.match_source),
+                "hik": dict(config.hik_options or {}),
+                "hik_applied": dict(hik_applied or {}),
+                "advisor": {
+                    "version": config.advisor_version,
+                    "changed_fields": list(config.advisor_changed_fields or []),
+                },
+            },
+            metrics=metrics_dict,
+            advisor_version=config.advisor_version,
+            pipeline_status="ok" if plot_ok else "failed",
+            pipeline_error=plot_error,
+        )
+        feedback_log.append_run_record(config.out_dir, record, run_id=run_id)
+    except Exception as exc:
+        logger.warn(f"feedback_log append failed for '{take_name}': {exc!r}")
+
+
 def _plot_phase(
     config: RunConfig,
     source_char,
@@ -609,8 +742,18 @@ def _plot_phase(
     hooks: Dict[str, Callable],
     report: RunReport,
     cancel_check: Optional[Callable[[], bool]] = None,
+    run_id: str = "",
 ) -> None:
     match_source_warned = False
+
+    # Capture features once per run: source/target rigs do not change between
+    # takes within a single run, so we save N-1 redundant evaluations.
+    pair_features = _extract_pair_features_for_run(source_char, target_char, logger)
+    pair_features_dict = pair_features.to_dict() if pair_features is not None else {}
+    source_height_m = (
+        pair_features.source.height_m if pair_features is not None else None
+    )
+
     for tn in take_names:
         if _is_cancelled(cancel_check, logger):
             return
@@ -624,19 +767,32 @@ def _plot_phase(
             if not apply_match_source(target_char, True) and not match_source_warned:
                 logger.warn("Match Source property not found on target; HIK defaults will be used.")
                 match_source_warned = True
+        hik_applied: Dict[str, bool] = {}
+        if config.hik_options:
+            hik_applied = apply_hik_options(target_char, config.hik_options, logger=logger)
+            missing = [k for k, ok in hik_applied.items() if not ok]
+            if missing:
+                logger.warn(
+                    f"  HIK options not exposed on target: {missing}. "
+                    "Recommendation recorded in feedback log but not applied."
+                )
         link_input(target_char, source_char)
+        plot_ok = False
+        plot_error = ""
         try:
             logger.info(f"Plotting take '{tn}' ...")
             _safe_call(hooks.get("pre_plot"), logger, "pre_plot", target_char, source_char, take)
             try:
-                ok = plot_to_skeleton(target_char, config.plot)
+                plot_ok = bool(plot_to_skeleton(target_char, config.plot))
             except Exception as exc:
-                logger.error(f"Plot crashed for '{tn}': {exc!r}")
+                plot_error = repr(exc)
+                logger.error(f"Plot crashed for '{tn}': {plot_error}")
                 _set_status(report, tn, "failed", error=str(exc))
                 continue
-            if not ok:
+            if not plot_ok:
+                plot_error = "PlotAnimation returned False"
                 logger.error(f"Plot returned False for '{tn}'.")
-                _set_status(report, tn, "failed", error="PlotAnimation returned False")
+                _set_status(report, tn, "failed", error=plot_error)
                 continue
             _safe_call(hooks.get("post_plot"), logger, "post_plot", target_char, take)
 
@@ -655,6 +811,21 @@ def _plot_phase(
         finally:
             unbind_input(target_char)
             _evaluate_scene()
+
+        _record_take_feedback(
+            config=config,
+            logger=logger,
+            report=report,
+            run_id=run_id,
+            take_name=tn,
+            source_char=source_char,
+            target_char=target_char,
+            pair_features_dict=pair_features_dict,
+            source_height_m=source_height_m,
+            hik_applied=hik_applied,
+            plot_ok=plot_ok,
+            plot_error=plot_error,
+        )
 
 
 def _evaluate_scene() -> None:

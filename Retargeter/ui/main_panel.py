@@ -33,6 +33,7 @@ from typing import List
 
 from ._qt import QtCore, QtGui, QtWidgets  # type: ignore
 
+from ..core import feedback_log
 from ..core.fbx_io import ExportConfig
 from ..core.logger import Logger
 from ..core.pipeline import (
@@ -126,6 +127,12 @@ class RetargeterPanel(QtWidgets.QWidget):
         self._options_dialog.extras_provider = lambda: {
             "engine_preset": self.cmb_engine.currentText()
         }
+        # Lets the dialog's Auto recommend button reach Source/Target without
+        # importing the panel directly (one-way dependency: dialog -> panel).
+        self._options_dialog.character_pair_provider = lambda: (
+            self.cmb_source.currentText(),
+            self.cmb_target.currentText(),
+        )
 
         outer.addWidget(self._build_menu_bar())
         outer.addWidget(self._build_top_toolbar())
@@ -429,7 +436,13 @@ class RetargeterPanel(QtWidgets.QWidget):
         self.btn_check_all = QtWidgets.QPushButton("Check all")
         self.btn_uncheck_all = QtWidgets.QPushButton("Uncheck all")
         self.btn_apply_root_motion = QtWidgets.QPushButton("Apply default root motion to all")
-        for b in (self.btn_check_all, self.btn_uncheck_all, self.btn_apply_root_motion):
+        self.btn_save_feedback = QtWidgets.QPushButton("Save feedback")
+        self.btn_save_feedback.setToolTip(
+            "Append the operator's Good/Bad labels in the Quality column to "
+            "_retarget_feedback.jsonl in the output folder. Rows with '-' are skipped."
+        )
+        for b in (self.btn_check_all, self.btn_uncheck_all,
+                  self.btn_apply_root_motion, self.btn_save_feedback):
             row.addWidget(b)
 
         row.addStretch(1)
@@ -511,6 +524,7 @@ class RetargeterPanel(QtWidgets.QWidget):
         self.btn_check_all.clicked.connect(lambda: self.take_table.set_all_checked(True))
         self.btn_uncheck_all.clicked.connect(lambda: self.take_table.set_all_checked(False))
         self.btn_apply_root_motion.clicked.connect(self._on_apply_root_motion_all)
+        self.btn_save_feedback.clicked.connect(self._on_save_feedback)
 
         # Log panel
         self.btn_clear_log.clicked.connect(self.log_view.clear_log)
@@ -780,11 +794,18 @@ class RetargeterPanel(QtWidgets.QWidget):
             plot_rate=int(opt.spn_plot_rate.value()),
             plot_translation=opt.chk_plot_translation.isChecked(),
             use_constant_key_reducer=opt.chk_const_key_reducer.isChecked(),
+            constant_key_reducer_keep_one=opt.chk_const_key_keep_one.isChecked(),
+            precise_time_discontinuities=opt.chk_precise_time_disc.isChecked(),
+            plot_all_takes=opt.chk_plot_all_takes.isChecked(),
+            rotation_filter=opt.cmb_rotation_filter.currentText(),
         )
         export = ExportConfig(
             fbx_version=opt.cmb_fbx_version.currentText(),
             ascii=opt.chk_ascii.isChecked(),
         )
+        hik_options = {
+            key: chk.isChecked() for key, chk in opt.chk_hik.items()
+        }
         cfg = RunConfig(
             source_character_name=self.cmb_source.currentText(),
             target_character_name=self.cmb_target.currentText(),
@@ -801,15 +822,60 @@ class RetargeterPanel(QtWidgets.QWidget):
             clean_existing_takes=opt.chk_clean_takes.isChecked(),
             cleanup_duplicate_bones=opt.chk_cleanup_dups.isChecked(),
             inject_metadata=opt.chk_inject_metadata.isChecked(),
+            hik_options=hik_options,
+            compute_metrics=opt.chk_compute_metrics.isChecked(),
             dry_run=dry_run,
             engine_preset=self.cmb_engine.currentText(),
         )
         cfg.take_plans = self.take_table.collect_plans()
+        # If the operator pressed Auto recommend earlier, carry the list of
+        # fields the advisor moved into the feedback log; main_panel does
+        # not interpret it, only forwards it.
+        try:
+            cfg.advisor_changed_fields = opt.last_advisor_changed_fields()
+        except Exception:
+            cfg.advisor_changed_fields = []
         return cfg
 
     def _on_apply_root_motion_all(self) -> None:
         mode = self._opt().cmb_root_motion.currentText()
         self.take_table.set_all_root_motion(mode)
+
+    def _on_save_feedback(self) -> None:
+        # out_dir is optional now: even without an output folder we still
+        # append to the central log so the operator can label scratch runs
+        # without losing the data.
+        out_dir = self.txt_out_dir.text().strip() or self._last_run_out_dir
+        labels = self.take_table.collect_quality_labels()
+        if not labels:
+            info_box(
+                self,
+                "Save feedback",
+                "No labelled takes to save. Set Quality to good or bad on at "
+                "least one row first.",
+            )
+            return
+        written = 0
+        for take_name, label in labels:
+            try:
+                path = feedback_log.update_label(
+                    out_dir, take_name, label, note="manual"
+                )
+                if path:
+                    written += 1
+            except Exception as exc:
+                self._log_line(f"[WARN] Could not write feedback for '{take_name}': {exc!r}")
+        central_path = feedback_log.central_feedback_path()
+        if written:
+            self._log_line(
+                f"[INFO] Saved feedback for {written} take(s). "
+                f"central={central_path}"
+                + (f"  project={feedback_log.feedback_path(out_dir)}" if out_dir else "")
+            )
+        msg = f"Saved {written} label(s).\n\nCentral log:\n{central_path}"
+        if out_dir:
+            msg += f"\n\nProject log:\n{feedback_log.feedback_path(out_dir)}"
+        info_box(self, "Save feedback", msg)
 
     def _on_dry_run(self) -> None:
         cfg = self._build_config(dry_run=True)
@@ -862,6 +928,14 @@ class RetargeterPanel(QtWidgets.QWidget):
         for r in report.results:
             tooltip = r.error or " | ".join(r.notes)
             self.take_table.set_status(r.take_name, r.status, tooltip=tooltip)
+            # Pre-fill quality hint from the metric-based label suggestion,
+            # but only on takes that succeeded and only when the operator
+            # has not labelled the row yet. set_quality_hint enforces both.
+            if r.status == "ok" and getattr(r, "label_hint", None):
+                try:
+                    self.take_table.set_quality_hint(r.take_name, r.label_hint)
+                except Exception:
+                    pass
 
         if cfg.out_dir:
             self._last_run_out_dir = cfg.out_dir

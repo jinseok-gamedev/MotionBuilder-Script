@@ -24,23 +24,35 @@ Retargeter/
   Retargeter_Start.py         # one-shot launcher (forwards to retargeter.py)
   __init__.py
   core/
-    scene_utils.py            # HumanIK discovery + validation
+    scene_utils.py            # HumanIK discovery + validation + slot/finger helpers
     fbx_io.py                 # animation-only import, take-by-take export, metadata
     take_manager.py           # take creation, naming, conflict handling
-    retarget_engine.py        # Character Input + Plot to Skeleton
+    retarget_engine.py        # Character Input + Plot to Skeleton + apply_hik_options
     root_motion.py            # Keep / Strip / Extract per take
     pipeline.py               # orchestration: hooks, dry-run, logging, isolation
     logger.py                 # tee logger (console + file + UI)
+    skeleton_features.py      # source/target shape measurements (height, widths, fingers, ...)
+    option_advisor.py         # rule-based recommender for PlotConfig + HIK options
+    feedback_log.py           # append-only JSONL of per-take options/features/labels
+    quality_metrics.py        # opt-in foot/wrist/hips/knee/shoulder quality scores
   ui/
     main_panel.py             # PySide2/6 main panel (split layout, toolbar, action bar)
-    options_dialog.py         # modeless options dialog (sidebar + paged + presets)
-    take_table.py             # per-take checkboxes + root motion combo + status filter
+    options_dialog.py         # modeless options dialog + Auto recommend / reasons
+    take_table.py             # per-take checkboxes + root motion + Quality (Good/Bad) + status
     file_list.py              # drag&drop FBX list with context menu
     log_view.py               # colored severity-aware log viewer
     _qt_helpers.py
   config/
-    default_settings.json     # default plot rate, fbx version, naming, etc.
+    default_settings.json     # default plot rate, fbx version, naming, hik options, etc.
     hooks.py                  # user-extensible pre/post hook slots
+```
+
+External (separate venv, optional - stage 2):
+
+```
+tools/
+  retargeter_ml/              # future ML trainer for the option recommender
+    README.md                 # placeholder, see "Auto option recommender" below
 ```
 
 ## Setup the "setting" FBX file (per case)
@@ -288,6 +300,79 @@ continues with the next take.
   metadata but the actual SDK version written is whatever the running
   MotionBuilder defaults to. To force a specific version, use the
   `FBFbxManager` API in a `pre_export` hook.
+
+## Auto option recommender (rule-based, with a path to ML)
+
+Picking the right combination of `match_source`, `HIKForceActorSpace`,
+`HIKScaleCompensation`, `HIKTopSpineCorrection`, `HIKFingerPropagation` and
+PlotConfig is mostly a function of how the source and target rigs differ in
+shape (height, shoulder width, spine subdivision, finger count, T-pose vs
+A-pose, ...). The Retargeter now ships a deterministic rule-based advisor
+that reads those shape features off the live HumanIK characters and proposes
+option values, with a documented reason for every change.
+
+How to use it:
+
+1. Set Source and Target on the panel.
+2. Open `Settings...` and go to the `Retargeting` page.
+3. Click `Auto recommend from characters`. Any widget the advisor touched
+   gets a yellow background and the `Recommendation reasons` panel lists why.
+4. Disagree with one? Just click the widget; the yellow tint clears for that
+   one. Or click `Undo Auto` to revert everything back to your pre-Auto
+   snapshot.
+
+The advisor lives in `Retargeter/core/option_advisor.py`. Rules are a single
+declarative list (`RULES`); adding a new heuristic is one function entry. The
+HIK 4-options surface (`apply_hik_options` in `retarget_engine.py`) resolves
+each option through (a) direct character attribute, (b) PropertyList alias
+table, (c) normalised PropertyList scan, (d) skip with a log warning.
+
+### Feedback loop
+
+Every plotted take appends one JSON line capturing:
+
+- the shape features the advisor saw,
+- the option values actually used + whether each HIK option was applied,
+- (optional) quality metrics if `Compute post-plot quality metrics` is on in
+  the Plot page,
+- the operator's Good/Bad label later, written by the panel's `Save feedback`
+  action (only takes with a `good` or `bad` quality entry are saved).
+
+The same line is written to **two** places so the data is both auditable
+per project and accumulated across projects for training:
+
+- **Project log** -- `{out_dir}/_retarget_feedback.jsonl`. Written only when
+  an output folder is set. Use this to ask "what options were used for this
+  specific batch?". Travels with the project folder; safe to delete.
+- **Central log** -- `~/.retargeter/feedback.jsonl` by default (or whatever
+  `$RETARGETER_FEEDBACK_PATH` points to). Append-forever, never written
+  outside this single file. This is the file stage-2 training reads. Point
+  the env var at a team-shared drive to pool labels across operators:
+
+  ```
+  setx RETARGETER_FEEDBACK_PATH "\\share\team\retargeter\feedback.jsonl"
+  ```
+
+Both writes are best-effort: a temporarily unreachable network share or a
+read-only project folder is silently skipped so the plot loop never stops
+because of feedback I/O. At least one of the two sinks usually succeeds.
+
+### Replacing the rules with a learned model
+
+The `Recommender` protocol is in place so a future `ModelBackedRecommender`
+can drop in without UI changes. Training will live in
+`tools/retargeter_ml/` (its own Python venv, separate from MotionBuilder):
+
+1. Read JSONL records into pandas.
+2. Use the operator's `good`/`bad` labels as the primary supervision; fall
+   back to a weighted combination of `quality_metrics` for unlabelled takes.
+3. Train a multi-output classifier for the boolean options and a regressor
+   for `plot_rate` / `plot_translation` (XGBoost or a small MLP).
+4. Save `Retargeter/data/option_recommender.joblib`.
+5. The MoBu-side `ModelBackedRecommender` calls the model via a `subprocess`
+   that runs inside the trainer venv; failures (model missing, timeout,
+   incompatible features) fall back to the rule-based advisor automatically
+   and surface that fact in the reason panel.
 
 ## Programmatic API
 
