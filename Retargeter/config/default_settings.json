@@ -24,6 +24,7 @@
         "HIKForceActorSpaceId": true,
         "HIKScaleCompensationId": false,
         "HIKTopSpineCorrectionId": true,
+        "HIKLowerSpineCorrectionId": true,
         "HIKFingerPropagationId": false
     },
     "root_motion": {

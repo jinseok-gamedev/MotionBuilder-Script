@@ -16,16 +16,22 @@ Design goals
   can drop in with the same interface. Rule-based stays as the safe default
   / fallback.
 
-The four HIK options the advisor speaks about
----------------------------------------------
+The HIK options the advisor speaks about
+----------------------------------------
 
-* ``HIKForceActorSpaceId``       - bias retarget into actor space (shoulder
-                                   width / hand position preservation).
-* ``HIKScaleCompensationId``     - compensate large height differences.
-* ``HIKTopSpineCorrectionId``    - clean up upper-spine drift when the
-                                   target has a different spine subdivision.
-* ``HIKFingerPropagationId``     - keep finger curl from leaking into the
-                                   wrist when the rigs disagree on fingers.
+* ``HIKForceActorSpaceId``        - bias retarget into actor space (shoulder
+                                    width / hand position preservation).
+* ``HIKScaleCompensationId``      - compensate large height differences.
+                                    Surfaces as a 0-100 percentage on some
+                                    rigs (Biped); see ``apply_hik_options``
+                                    for the bool -> percentage coercion.
+* ``HIKTopSpineCorrectionId``     - clean up upper-spine drift when the
+                                    target has a different spine subdivision.
+* ``HIKLowerSpineCorrectionId``   - clean up lower-spine drift (paired with
+                                    Top Spine Correction; both fire on the
+                                    same spine-subdivision trigger).
+* ``HIKFingerPropagationId``      - keep finger curl from leaking into the
+                                    wrist when the rigs disagree on fingers.
 
 The advisor emits booleans for these and lets
 :func:`Retargeter.core.retarget_engine.apply_hik_options` resolve the
@@ -46,12 +52,13 @@ from .retarget_engine import PlotConfig
 from .skeleton_features import PairFeatures
 
 
-# The four HIK option keys the advisor speaks about. Kept as a tuple so the
+# The HIK option keys the advisor speaks about. Kept as a tuple so the
 # UI can iterate them in display order without duplicating the list.
 HIK_OPTION_KEYS = (
     "HIKForceActorSpaceId",
     "HIKScaleCompensationId",
     "HIKTopSpineCorrectionId",
+    "HIKLowerSpineCorrectionId",
     "HIKFingerPropagationId",
 )
 
@@ -182,11 +189,21 @@ def _rule_spine_segments(features: PairFeatures, ctx: _Context) -> None:
             True,
             f"스파인 분절 수 차이 {delta} - HIKTopSpineCorrection=on (상체 비틀림 보정)",
         )
+        ctx.set_hik(
+            "HIKLowerSpineCorrectionId",
+            True,
+            f"스파인 분절 수 차이 {delta} - HIKLowerSpineCorrection=on (하체 비틀림 보정)",
+        )
     else:
         ctx.set_hik(
             "HIKTopSpineCorrectionId",
             False,
             f"스파인 분절 수 차이 {delta} - HIKTopSpineCorrection=off",
+        )
+        ctx.set_hik(
+            "HIKLowerSpineCorrectionId",
+            False,
+            f"스파인 분절 수 차이 {delta} - HIKLowerSpineCorrection=off",
         )
 
 

@@ -53,12 +53,13 @@ _DEFAULT_SETTINGS_PATH = os.path.normpath(
 # at a glance which options the advisor changed (vs. their own picks).
 _AUTO_HIGHLIGHT_STYLE = "background-color: #fff59d;"   # soft amber
 
-# Human labels for the four HIK option keys, kept in display order matching
+# Human labels for the HIK option keys, kept in display order matching
 # HIK_OPTION_KEYS so a future addition is a single tuple entry.
 _HIK_OPTION_LABELS: Tuple[Tuple[str, str], ...] = (
     ("HIKForceActorSpaceId", "Force Actor Space (어깨/팔 actor-space 보존)"),
-    ("HIKScaleCompensationId", "Scale Compensation (키 차이 보정)"),
+    ("HIKScaleCompensationId", "Scale Compensation (키 차이 보정, 0~100%)"),
     ("HIKTopSpineCorrectionId", "Top Spine Correction (상체 비틀림 보정)"),
+    ("HIKLowerSpineCorrectionId", "Lower Spine Correction (하체 비틀림 보정)"),
     ("HIKFingerPropagationId", "Finger Propagation (손가락 전파 차단)"),
 )
 
@@ -1310,17 +1311,48 @@ class OptionsDialog(QtWidgets.QDialog):
             name = info.get("name") or "-"
             value = info.get("value")
             marker = "OK" if exposed else "--"
+            norm_key = info.get("normalised_key") or "-"
+            norm_name = info.get("normalised_name")
             lines.append(f"[{marker}] {key}")
             lines.append(f"      via={via}  name={name}  value={value!r}")
+            redirected_from = info.get("redirected_from")
+            if redirected_from:
+                # The char-side property was a no-op proxy; the resolver
+                # hopped to the solver-side actual writable. Surface the
+                # original proxy name so the operator can confirm what
+                # is being written and where.
+                lines.append(
+                    f"      redirected from char-side proxy: {redirected_from!r}"
+                )
+            value_via = info.get("value_via")
+            if value_via and value_via not in ("Data", None):
+                # plain prop.Data returned None on this MoBu build for this
+                # property (typically a solver-owned animatable double);
+                # show which typed-accessor fallback actually produced the
+                # value so the operator can trust the displayed number.
+                lines.append(f"      value read via prop.{value_via}()")
+            if exposed and norm_name and norm_name != norm_key:
+                lines.append(
+                    f"      normalised: key={norm_key!r}  name={norm_name!r}  (match)"
+                )
+            elif exposed:
+                lines.append(f"      normalised: {norm_key!r}")
             note = info.get("note")
             if note:
                 lines.append(f"      note: {note}")
             cands = info.get("candidates") or []
-            if not exposed and cands:
-                shown = ", ".join(cands[:6])
-                if len(cands) > 6:
-                    shown += f", ... (+{len(cands) - 6} more)"
-                lines.append(f"      tried: {shown}")
+            if not exposed:
+                lines.append(f"      normalised key: {norm_key!r}")
+                if cands:
+                    shown = ", ".join(cands[:6])
+                    if len(cands) > 6:
+                        shown += f", ... (+{len(cands) - 6} more)"
+                    lines.append(f"      tried: {shown}")
+                near = info.get("near_misses") or []
+                if near:
+                    lines.append("      near misses on rig:")
+                    for pname, pnorm in near:
+                        lines.append(f"        - {pname!r} -> {pnorm!r}")
             lines.append("")
 
         self.txt_reasons.setPlainText("\n".join(lines))
